@@ -11,7 +11,7 @@ from typing import List, Dict
 import random
 import string
 
-app = FastAPI(title="Karargah Backend v1.3 - Gizli Operasyon Odaları")
+app = FastAPI(title="Karargah Backend v1.4 - Dinamik Kanallar ve İzolasyon")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,6 +24,7 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
+# 1. VERİTABANI YENİDEN İNŞASI VE GÜNCELLEMELER
 def init_db():
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
@@ -32,7 +33,11 @@ def init_db():
     cursor.execute("""CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, owner TEXT NOT NULL, icon_url TEXT DEFAULT '', invite_code TEXT DEFAULT '')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, channel_name TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, time_str TEXT NOT NULL, msg_type TEXT DEFAULT 'chat')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS server_roles (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, username TEXT NOT NULL, role TEXT NOT NULL, UNIQUE(server_name, username))""")
+    
+    # YENİ TABLO: DİNAMİK KANALLAR
+    cursor.execute("""CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, channel_name TEXT NOT NULL, channel_type TEXT NOT NULL, UNIQUE(server_name, channel_name, channel_type))""")
 
+    # Eski DB varsa yama yapsın
     try: cursor.execute("ALTER TABLE operators ADD COLUMN avatar_url TEXT DEFAULT ''")
     except: pass
     try: cursor.execute("ALTER TABLE servers ADD COLUMN icon_url TEXT DEFAULT ''")
@@ -42,22 +47,46 @@ def init_db():
     try: cursor.execute("ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT 'chat'")
     except: pass
 
-    # GÜNCELLEME 1: İlk kurulumda kanalın sahibini SİSTEM değil AKIN yapıyoruz.
+    # GÜNCELLEME 1: KUZEY KARTALLARI İZOLASYONU (TAPU 'AKIN' KULLANICISINA VERİLİYOR)
     cursor.execute("SELECT COUNT(*) FROM servers")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO servers (name, owner) VALUES ('KUZEY KARTALLARI', 'AKIN')")
         
-    # GÜNCELLEME 2: Railway'deki mevcut veritabanında SİSTEM'de kalan tapuyu AKIN'a devrediyoruz!
     try:
+        # Mevcut veritabanındaki global KUZEY KARTALLARI'nı AKIN'a devret
         cursor.execute("UPDATE servers SET owner = 'AKIN' WHERE name = 'KUZEY KARTALLARI' AND owner = 'SİSTEM'")
     except: pass
+
+    # GÜNCELLEME 2: MEVCUT SUNUCULARA VARSAYILAN KANALLARI EKLEME
+    cursor.execute("SELECT name FROM servers")
+    existing_servers = cursor.fetchall()
+    for srv in existing_servers:
+        s_name = srv[0]
+        try:
+            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (s_name, "operasyon-merkezi", "text"))
+            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (s_name, "istihbarat-raporu", "text"))
+            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (s_name, "GİZLİ HAREKAT", "voice"))
+        except:
+            pass # Zaten ekliyse hata vermez, geçer
 
     conn.commit()
     conn.close()
 
 init_db()
 
+# --- MODELLER ---
 class PrimeUpdate(BaseModel): username: str
+class ServerIconUpdate(BaseModel): server_name: str; icon_url: str
+class OperatorAuth(BaseModel): username: str; password: str
+class ServerCreate(BaseModel): name: str; owner: str
+class RoleUpdate(BaseModel): server_name: str; username: str; role: str
+class ProfileUpdate(BaseModel): username: str; avatar_url: str
+class JoinServerData(BaseModel): username: str; invite_code: str
+class ChannelCreate(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
+class ChannelDelete(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
+
+# --- REST API UÇ NOKTALARI ---
+
 @app.post("/api/upgrade-prime")
 def upgrade_to_prime(data: PrimeUpdate):
     conn = sqlite3.connect("karargah.db")
@@ -67,7 +96,6 @@ def upgrade_to_prime(data: PrimeUpdate):
     conn.close()
     return {"status": "success"}
 
-class ServerIconUpdate(BaseModel): server_name: str; icon_url: str
 @app.post("/api/update-server-icon")
 def update_server_icon(data: ServerIconUpdate):
     conn = sqlite3.connect("karargah.db")
@@ -86,9 +114,6 @@ def check_prime(username: str):
     conn.close()
     return {"status": "success", "is_prime": result[0] if result else 0}
 
-class OperatorAuth(BaseModel): username: str; password: str
-class ServerCreate(BaseModel): name: str; owner: str
-
 @app.post("/api/upload")
 async def upload_image(request: Request, file: UploadFile = File(...)):
     safe_filename = file.filename.replace(" ", "_")
@@ -96,9 +121,6 @@ async def upload_image(request: Request, file: UploadFile = File(...)):
     with open(file_location, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
     base_url = str(request.base_url).rstrip("/")
     return {"status": "success", "url": f"{base_url}/uploads/{safe_filename}"}
-
-class RoleUpdate(BaseModel): server_name: str; username: str; role: str
-class ProfileUpdate(BaseModel): username: str; avatar_url: str
 
 @app.post("/api/update-profile")
 def update_profile(data: ProfileUpdate):
@@ -173,6 +195,12 @@ def create_server(data: ServerCreate):
         raise HTTPException(status_code=403, detail="Maksimum karargah sınırına (3) ulaştınız!")
     try:
         cursor.execute("INSERT INTO servers (name, owner) VALUES (?, ?)", (data.name, data.owner))
+        
+        # YENİ SUNUCUYA VARSAYILAN KANALLARI EKLE
+        cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (data.name, "operasyon-merkezi", "text"))
+        cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (data.name, "istihbarat-raporu", "text"))
+        cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (data.name, "GİZLİ HAREKAT", "voice"))
+        
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
@@ -180,24 +208,67 @@ def create_server(data: ServerCreate):
     finally: conn.close()
     return {"status": "success"}
 
-# 2. ODALARIN GİZLİLİĞİ SAĞLANDI! (SADECE YETKİSİ OLAN GÖRÜR)
-@app.get("/api/servers/{username}")
+# GÜNCELLEME 3: ARTIK HERKES SADECE KENDİ ODASINI VEYA DAVETLİ OLDUĞUNU GÖRÜR
 @app.get("/api/servers/{username}")
 def get_servers(username: str):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    
-    # GÜNCELLEME 3: ARTIK "owner = 'SİSTEM'" ŞARTI YOK! 
-    # Herkes sadece kendi kurduğu veya davet edildiği odayı görecek.
     cursor.execute("""
         SELECT name, owner, icon_url 
         FROM servers 
         WHERE owner = ? OR name IN (SELECT server_name FROM server_roles WHERE username = ?)
     """, (username, username))
-    
     servers = cursor.fetchall()
     conn.close()
     return {"status": "success", "servers": [{"name": s[0], "owner": s[1], "icon_url": s[2] if len(s)>2 and s[2] else ""} for s in servers]}
+
+# YENİ KANAL YÖNETİM API'LERİ
+@app.get("/api/channels/{server_name}")
+def get_channels(server_name: str):
+    conn = sqlite3.connect("karargah.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT channel_name, channel_type FROM channels WHERE server_name = ?", (server_name,))
+    channels = cursor.fetchall()
+    conn.close()
+    return {"status": "success", "channels": [{"name": c[0], "type": c[1]} for c in channels]}
+
+@app.post("/api/channels")
+def create_channel(data: ChannelCreate):
+    conn = sqlite3.connect("karargah.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT owner FROM servers WHERE name = ?", (data.server_name,))
+    owner = cursor.fetchone()
+    # Şimdilik sadece kurucu açabilir
+    if not owner or owner[0] != data.operator_name:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Sadece Karargah Komutanı yeni kanal açabilir!")
+        
+    try:
+        # İsimleri formata uygun hale getirme (Boşlukları '-' yap, BÜYÜK harf yap)
+        safe_name = data.channel_name.replace(" ", "-").upper()
+        cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (data.server_name, safe_name, data.channel_type))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Bu isimde bir kanal zaten var!")
+    finally:
+        conn.close()
+    return {"status": "success"}
+
+@app.delete("/api/channels")
+def delete_channel(data: ChannelDelete):
+    conn = sqlite3.connect("karargah.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT owner FROM servers WHERE name = ?", (data.server_name,))
+    owner = cursor.fetchone()
+    if not owner or owner[0] != data.operator_name:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Sadece Karargah Komutanı kanal silebilir!")
+        
+    cursor.execute("DELETE FROM channels WHERE server_name = ? AND channel_name = ? AND channel_type = ?", (data.server_name, data.channel_name, data.channel_type))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
 
 @app.get("/api/messages/{server_name}/{channel_name}")
 def get_messages(server_name: str, channel_name: str):
@@ -207,6 +278,8 @@ def get_messages(server_name: str, channel_name: str):
     msgs = cursor.fetchall()
     conn.close()
     return {"status": "success", "messages": [{"name": m[0], "text": m[1], "time": m[2], "type": m[3] if len(m)>3 and m[3] else "chat"} for m in msgs]}
+
+# --- WEBSOCKET & DAVET KODU ---
 
 class ConnectionManager:
     def __init__(self): self.rooms: Dict[str, Dict[str, WebSocket]] = {}
@@ -231,8 +304,6 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-class JoinServerData(BaseModel): username: str; invite_code: str
-
 @app.get("/api/servers/{server_name}/generate-invite")
 def generate_invite(server_name: str):
     conn = sqlite3.connect("karargah.db")
@@ -243,7 +314,6 @@ def generate_invite(server_name: str):
     conn.close()
     return {"status": "success", "invite_code": code}
 
-# 3. KULLANICI DAVET KODUYLA GİRİNCE ARTIK ODAYA RESMEN KAYDEDİLİYOR
 @app.post("/api/join-server")
 def join_server(data: JoinServerData):
     conn = sqlite3.connect("karargah.db")
@@ -254,11 +324,10 @@ def join_server(data: JoinServerData):
     if result:
         server_name = result[0]
         try:
-            # Odaya girdiğinde "OPERATÖR" rolüyle veritabanına eklenir ki sonradan da odayı görebilsin
             cursor.execute("INSERT INTO server_roles (server_name, username, role) VALUES (?, ?, ?)", (server_name, data.username, "OPERATÖR"))
             conn.commit()
         except sqlite3.IntegrityError:
-            pass # Zaten odadaysa hata vermesin
+            pass
         conn.close()
         return {"status": "success", "server_name": server_name}
         
