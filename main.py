@@ -11,7 +11,7 @@ from typing import List, Dict, Optional
 import random
 import string
 
-app = FastAPI(title="Karargah Backend v1.5 - Shopier & Güvenlik Sürümü")
+app = FastAPI(title="Karargah Backend v1.6 - Admin Yetkisi & SQL Fix")
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,16 +74,12 @@ class JoinServerData(BaseModel): username: str; invite_code: str
 class ChannelCreate(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
 class ChannelDelete(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
 
-# YENİ: SHOPIER WEBHOOK API (Ödeme başarılı olunca Shopier buraya sinyal atacak)
 @app.post("/api/shopier-webhook")
 async def shopier_webhook(request: Request):
     try:
-        # Shopier veriyi form payload olarak gönderir
         form_data = await request.form()
         status = form_data.get("status")
-        # Adamın Shopier ödeme sayfasında girdiği "Sipariş Notu" veya custom_field (Operatör Adı)
         operator_name = form_data.get("custom_payload") or form_data.get("order_note") 
-        
         if status == "success" and operator_name:
             safe_op_name = operator_name.strip().upper()
             conn = sqlite3.connect("karargah.db")
@@ -92,14 +88,12 @@ async def shopier_webhook(request: Request):
             conn.commit()
             conn.close()
             return {"status": "success", "message": f"{safe_op_name} Prime yapildi."}
-            
         return {"status": "ignored"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
 @app.post("/api/upgrade-prime")
 def upgrade_to_prime(data: PrimeUpdate):
-    # Bu eski sahte butondur, ilerde silinebilir. Şimdilik sistem testleri için duruyor.
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
     cursor.execute("UPDATE operators SET is_prime = 1 WHERE username = ?", (data.username,))
@@ -111,7 +105,8 @@ def upgrade_to_prime(data: PrimeUpdate):
 def update_server_icon(data: ServerIconUpdate):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    cursor.execute("UPDATE SET icon_url = ? WHERE name = ?", (data.icon_url, data.server_name))
+    # DÜZELTME 1: "servers" tablosunun adını ekledik, SQL hatası çözüldü!
+    cursor.execute("UPDATE servers SET icon_url = ? WHERE name = ?", (data.icon_url, data.server_name))
     conn.commit()
     conn.close()
     return {"status": "success"}
@@ -123,7 +118,9 @@ def check_prime(username: str):
     cursor.execute("SELECT is_prime FROM operators WHERE username = ?", (username,))
     result = cursor.fetchone()
     conn.close()
-    return {"status": "success", "is_prime": result[0] if result else 0}
+    # DÜZELTME 2: 'AKIN' her zaman TANRI (Prime) modundadır!
+    is_prime = 1 if username == "AKIN" else (result[0] if result else 0)
+    return {"status": "success", "is_prime": is_prime}
 
 @app.post("/api/upload")
 async def upload_image(request: Request, file: UploadFile = File(...)):
@@ -149,7 +146,10 @@ def get_profile(username: str):
     cursor.execute("SELECT avatar_url, is_prime FROM operators WHERE username = ?", (username,))
     result = cursor.fetchone()
     conn.close()
-    if result: return {"status": "success", "avatar_url": result[0], "is_prime": result[1]}
+    if result: 
+        # DÜZELTME 3: AKIN Profilde de Prime görünür
+        is_prime = 1 if username == "AKIN" else result[1]
+        return {"status": "success", "avatar_url": result[0], "is_prime": is_prime}
     return {"status": "error"}
 
 @app.post("/api/server/role")
@@ -179,8 +179,7 @@ def register_operator(data: OperatorAuth):
     try:
         cursor.execute("INSERT INTO operators (username, password) VALUES (?, ?)", (data.username, data.password))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass # Supabase üzerinden geliyorsa zaten kayıtlı olabilir
+    except sqlite3.IntegrityError: pass 
     finally: conn.close()
     return {"status": "success"}
 
@@ -191,7 +190,8 @@ def create_server(data: ServerCreate):
     
     cursor.execute("SELECT is_prime FROM operators WHERE username = ?", (data.owner,))
     user_data = cursor.fetchone()
-    is_prime = user_data[0] if user_data else 0
+    # DÜZELTME 4: AKIN 5 Karargah kurabilir. Diğerleri 1.
+    is_prime = 1 if data.owner == "AKIN" else (user_data[0] if user_data else 0)
     
     cursor.execute("SELECT COUNT(*) FROM servers WHERE owner = ?", (data.owner,))
     server_count = cursor.fetchone()[0]
