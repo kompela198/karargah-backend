@@ -24,18 +24,15 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# 1. VERİTABANI YENİDEN İNŞASI (HATA DÜZELTİLDİ)
 def init_db():
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
     
-    # Sütunlar Railway'de sıfırdan sorunsuz kurulsun diye eksiksiz yazıldı!
     cursor.execute("""CREATE TABLE IF NOT EXISTS operators (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, is_prime INTEGER DEFAULT 0, avatar_url TEXT DEFAULT '')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, owner TEXT NOT NULL, icon_url TEXT DEFAULT '', invite_code TEXT DEFAULT '')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, channel_name TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, time_str TEXT NOT NULL, msg_type TEXT DEFAULT 'chat')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS server_roles (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, username TEXT NOT NULL, role TEXT NOT NULL, UNIQUE(server_name, username))""")
 
-    # Eski DB varsa yama yapsın
     try: cursor.execute("ALTER TABLE operators ADD COLUMN avatar_url TEXT DEFAULT ''")
     except: pass
     try: cursor.execute("ALTER TABLE servers ADD COLUMN icon_url TEXT DEFAULT ''")
@@ -45,10 +42,16 @@ def init_db():
     try: cursor.execute("ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT 'chat'")
     except: pass
 
-    # Herkesin otomatik göreceği Global Merkez Odası
+    # GÜNCELLEME 1: İlk kurulumda kanalın sahibini SİSTEM değil AKIN yapıyoruz.
     cursor.execute("SELECT COUNT(*) FROM servers")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO servers (name, owner) VALUES ('KUZEY KARTALLARI', 'SİSTEM')")
+        cursor.execute("INSERT INTO servers (name, owner) VALUES ('KUZEY KARTALLARI', 'AKIN')")
+        
+    # GÜNCELLEME 2: Railway'deki mevcut veritabanında SİSTEM'de kalan tapuyu AKIN'a devrediyoruz!
+    try:
+        cursor.execute("UPDATE servers SET owner = 'AKIN' WHERE name = 'KUZEY KARTALLARI' AND owner = 'SİSTEM'")
+    except: pass
+
     conn.commit()
     conn.close()
 
@@ -179,15 +182,19 @@ def create_server(data: ServerCreate):
 
 # 2. ODALARIN GİZLİLİĞİ SAĞLANDI! (SADECE YETKİSİ OLAN GÖRÜR)
 @app.get("/api/servers/{username}")
+@app.get("/api/servers/{username}")
 def get_servers(username: str):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    # Sadece 'SİSTEM' odasını, Kendi kurduğu odayı VEYA Davetle girdiği odaları getirir!
+    
+    # GÜNCELLEME 3: ARTIK "owner = 'SİSTEM'" ŞARTI YOK! 
+    # Herkes sadece kendi kurduğu veya davet edildiği odayı görecek.
     cursor.execute("""
         SELECT name, owner, icon_url 
         FROM servers 
-        WHERE owner = 'SİSTEM' OR owner = ? OR name IN (SELECT server_name FROM server_roles WHERE username = ?)
+        WHERE owner = ? OR name IN (SELECT server_name FROM server_roles WHERE username = ?)
     """, (username, username))
+    
     servers = cursor.fetchall()
     conn.close()
     return {"status": "success", "servers": [{"name": s[0], "owner": s[1], "icon_url": s[2] if len(s)>2 and s[2] else ""} for s in servers]}
