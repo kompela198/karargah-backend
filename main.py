@@ -149,10 +149,24 @@ def get_friends(username: str):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
     
-    # Kendi friend_code'umuzu çekelim
     cursor.execute("SELECT friend_code FROM operators WHERE username = ?", (username,))
     my_code_row = cursor.fetchone()
-    my_code = my_code_row[0] if my_code_row and my_code_row[0] else "---"
+    
+    # --- YENİ OTOMATİK TAMİRCİ (AUTO-HEAL) ---
+    if not my_code_row:
+        # Adam yerel veritabanında yoksa (Supabase'den direkt sızdıysa) anında oluştur!
+        my_code = str(random.randint(10000000, 99999999))
+        cursor.execute("INSERT INTO operators (username, password, friend_code) VALUES (?, ?, ?)", (username, "supabase_secured", my_code))
+        conn.commit()
+    elif not my_code_row[0] or len(str(my_code_row[0])) < 5:
+        # Adam var ama Steam kodu boş kalmışsa anında yeni kod bas!
+        my_code = str(random.randint(10000000, 99999999))
+        cursor.execute("UPDATE operators SET friend_code = ? WHERE username = ?", (my_code, username))
+        conn.commit()
+    else:
+        # Her şey tamamsa kodu al
+        my_code = my_code_row[0]
+    # ------------------------------------------
 
     cursor.execute("SELECT sender FROM friends WHERE receiver = ? AND status = 'pending'", (username,))
     incoming_requests = [row[0] for row in cursor.fetchall()]
