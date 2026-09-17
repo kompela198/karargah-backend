@@ -2,6 +2,7 @@ import json
 import sqlite3
 import os
 import shutil
+import time
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,15 +12,9 @@ from typing import List, Dict, Optional
 import random
 import string
 
-app = FastAPI(title="Karargah Backend v1.6 - Admin Yetkisi & SQL Fix")
+app = FastAPI(title="Karargah Backend v1.7 - Arkadaslik ve DM Altyapisi")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
@@ -32,6 +27,10 @@ def init_db():
     cursor.execute("""CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, channel_name TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, time_str TEXT NOT NULL, msg_type TEXT DEFAULT 'chat')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS server_roles (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, username TEXT NOT NULL, role TEXT NOT NULL, UNIQUE(server_name, username))""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, channel_name TEXT NOT NULL, channel_type TEXT NOT NULL, UNIQUE(server_name, channel_name, channel_type))""")
+    
+    # YENİ: ARKADAŞLIK VE ÖZEL MESAJ TABLOLARI
+    cursor.execute("""CREATE TABLE IF NOT EXISTS friends (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, receiver TEXT NOT NULL, status TEXT DEFAULT 'pending', UNIQUE(sender, receiver))""")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS direct_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, receiver TEXT NOT NULL, text TEXT NOT NULL, time_str TEXT NOT NULL, msg_type TEXT DEFAULT 'chat')""")
 
     try: cursor.execute("ALTER TABLE operators ADD COLUMN avatar_url TEXT DEFAULT ''")
     except: pass
@@ -43,20 +42,16 @@ def init_db():
     except: pass
 
     cursor.execute("SELECT COUNT(*) FROM servers")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO servers (name, owner) VALUES ('KUZEY KARTALLARI', 'AKIN')")
-        
+    if cursor.fetchone()[0] == 0: cursor.execute("INSERT INTO servers (name, owner) VALUES ('KUZEY KARTALLARI', 'AKIN')")
     try: cursor.execute("UPDATE servers SET owner = 'AKIN' WHERE name = 'KUZEY KARTALLARI' AND owner = 'SİSTEM'")
     except: pass
 
     cursor.execute("SELECT name FROM servers")
-    existing_servers = cursor.fetchall()
-    for srv in existing_servers:
-        s_name = srv[0]
+    for srv in cursor.fetchall():
         try:
-            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (s_name, "operasyon-merkezi", "text"))
-            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (s_name, "istihbarat-raporu", "text"))
-            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (s_name, "GİZLİ HAREKAT", "voice"))
+            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (srv[0], "operasyon-merkezi", "text"))
+            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (srv[0], "istihbarat-raporu", "text"))
+            cursor.execute("INSERT INTO channels (server_name, channel_name, channel_type) VALUES (?, ?, ?)", (srv[0], "GİZLİ HAREKAT", "voice"))
         except: pass
 
     conn.commit()
@@ -74,6 +69,86 @@ class JoinServerData(BaseModel): username: str; invite_code: str
 class ChannelCreate(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
 class ChannelDelete(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
 
+# YENİ: ARKADAŞLIK SİSTEMİ MODELLERİ
+class FriendRequestData(BaseModel): sender: str; receiver: str
+class FriendRespondData(BaseModel): sender: str; receiver: str; action: str # 'accept' veya 'reject'
+
+# --- YENİ ARKADAŞLIK API'LERİ ---
+
+@app.post("/api/friends/request")
+def send_friend_request(data: FriendRequestData):
+    conn = sqlite3.connect("karargah.db")
+    cursor = conn.cursor()
+    # Hedef kişi sistemde var mı?
+    cursor.execute("SELECT id FROM operators WHERE username = ?", (data.receiver,))
+    if not cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Böyle bir operatör bulunamadı!")
+    
+    if data.sender == data.receiver:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Kendinize istek gönderemezsiniz!")
+
+    try:
+        # Önce ters yönde (onun sana attığı) bir istek var mı bak, varsa direkt kabul et!
+        cursor.execute("SELECT status FROM friends WHERE sender = ? AND receiver = ?", (data.receiver, data.sender))
+        existing_reverse = cursor.fetchone()
+        if existing_reverse:
+            cursor.execute("UPDATE friends SET status = 'accepted' WHERE sender = ? AND receiver = ?", (data.receiver, data.sender))
+            conn.commit()
+            conn.close()
+            return {"status": "success", "message": "Arkadaşlık karşılıklı onaylandı!"}
+
+        cursor.execute("INSERT INTO friends (sender, receiver, status) VALUES (?, ?, 'pending')", (data.sender, data.receiver))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Zaten bir istek gönderilmiş veya arkadaşsınız!")
+    finally: conn.close()
+    return {"status": "success", "message": "İstek gönderildi."}
+
+@app.post("/api/friends/respond")
+def respond_friend_request(data: FriendRespondData):
+    conn = sqlite3.connect("karargah.db")
+    cursor = conn.cursor()
+    if data.action == "accept":
+        cursor.execute("UPDATE friends SET status = 'accepted' WHERE sender = ? AND receiver = ?", (data.sender, data.receiver))
+    elif data.action == "reject":
+        cursor.execute("DELETE FROM friends WHERE sender = ? AND receiver = ?", (data.sender, data.receiver))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.get("/api/friends/{username}")
+def get_friends(username: str):
+    conn = sqlite3.connect("karargah.db")
+    cursor = conn.cursor()
+    
+    # 1. Gelen Bekleyen İstekler (Bana atılanlar)
+    cursor.execute("SELECT sender FROM friends WHERE receiver = ? AND status = 'pending'", (username,))
+    incoming_requests = [row[0] for row in cursor.fetchall()]
+    
+    # 2. Kabul Edilmiş Arkadaşlar (Benim attığım veya bana atılan onaylılar)
+    cursor.execute("""
+        SELECT receiver FROM friends WHERE sender = ? AND status = 'accepted'
+        UNION
+        SELECT sender FROM friends WHERE receiver = ? AND status = 'accepted'
+    """, (username, username))
+    accepted_friends = [row[0] for row in cursor.fetchall()]
+    
+    # Arkadaşların profillerini (avatar ve prime durumu) çek
+    friends_data = []
+    for f_name in accepted_friends:
+        cursor.execute("SELECT avatar_url, is_prime FROM operators WHERE username = ?", (f_name,))
+        res = cursor.fetchone()
+        is_prime = 1 if f_name == "AKIN" else (res[1] if res else 0)
+        friends_data.append({"username": f_name, "avatar_url": res[0] if res else "", "is_prime": is_prime})
+        
+    conn.close()
+    return {"status": "success", "incoming_requests": incoming_requests, "friends": friends_data}
+
+# --------------------------------
+
 @app.post("/api/shopier-webhook")
 async def shopier_webhook(request: Request):
     try:
@@ -89,8 +164,7 @@ async def shopier_webhook(request: Request):
             conn.close()
             return {"status": "success", "message": f"{safe_op_name} Prime yapildi."}
         return {"status": "ignored"}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+    except Exception as e: return {"status": "error", "detail": str(e)}
 
 @app.post("/api/upgrade-prime")
 def upgrade_to_prime(data: PrimeUpdate):
@@ -105,7 +179,6 @@ def upgrade_to_prime(data: PrimeUpdate):
 def update_server_icon(data: ServerIconUpdate):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    # DÜZELTME 1: "servers" tablosunun adını ekledik, SQL hatası çözüldü!
     cursor.execute("UPDATE servers SET icon_url = ? WHERE name = ?", (data.icon_url, data.server_name))
     conn.commit()
     conn.close()
@@ -118,16 +191,16 @@ def check_prime(username: str):
     cursor.execute("SELECT is_prime FROM operators WHERE username = ?", (username,))
     result = cursor.fetchone()
     conn.close()
-    # DÜZELTME 2: 'AKIN' her zaman TANRI (Prime) modundadır!
     is_prime = 1 if username == "AKIN" else (result[0] if result else 0)
     return {"status": "success", "is_prime": is_prime}
 
 @app.post("/api/upload")
 async def upload_image(request: Request, file: UploadFile = File(...)):
-    safe_filename = file.filename.replace(" ", "_")
+    timestamp = int(time.time())
+    safe_filename = f"{timestamp}_{file.filename.replace(' ', '_')}"
     file_location = f"uploads/{safe_filename}"
     with open(file_location, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
-    base_url = str(request.base_url).rstrip("/")
+    base_url = "https://karargah-backend-production.up.railway.app"
     return {"status": "success", "url": f"{base_url}/uploads/{safe_filename}"}
 
 @app.post("/api/update-profile")
@@ -147,7 +220,6 @@ def get_profile(username: str):
     result = cursor.fetchone()
     conn.close()
     if result: 
-        # DÜZELTME 3: AKIN Profilde de Prime görünür
         is_prime = 1 if username == "AKIN" else result[1]
         return {"status": "success", "avatar_url": result[0], "is_prime": is_prime}
     return {"status": "error"}
@@ -187,15 +259,11 @@ def register_operator(data: OperatorAuth):
 def create_server(data: ServerCreate):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    
     cursor.execute("SELECT is_prime FROM operators WHERE username = ?", (data.owner,))
     user_data = cursor.fetchone()
-    # DÜZELTME 4: AKIN 5 Karargah kurabilir. Diğerleri 1.
     is_prime = 1 if data.owner == "AKIN" else (user_data[0] if user_data else 0)
-    
     cursor.execute("SELECT COUNT(*) FROM servers WHERE owner = ?", (data.owner,))
     server_count = cursor.fetchone()[0]
-    
     max_servers = 5 if is_prime else 1
     
     if server_count >= max_servers:
