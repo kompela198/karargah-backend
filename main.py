@@ -12,7 +12,7 @@ from typing import List, Dict, Optional
 import random
 import string
 
-app = FastAPI(title="Karargah Backend v1.8 - Steam Friend Code Altyapisi")
+app = FastAPI(title="Karargah Backend v1.9 - Direct Call Ringing Engine")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -48,7 +48,6 @@ def init_db():
     try: cursor.execute("ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT 'chat'")
     except: pass
 
-    # Mevcut operatörlere (AKIN, AKINTO vs.) kodu yoksa otomatik 8 haneli Steam ID basıyoruz!
     cursor.execute("SELECT id, username, friend_code FROM operators")
     users = cursor.fetchall()
     for u in users:
@@ -83,11 +82,10 @@ class ProfileUpdate(BaseModel): username: str; avatar_url: str
 class JoinServerData(BaseModel): username: str; invite_code: str
 class ChannelCreate(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
 class ChannelDelete(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
-
-class FriendRequestData(BaseModel): sender: str; target: str # İster İsim, İster 8 Haneli Kod
+class FriendRequestData(BaseModel): sender: str; target: str
 class FriendRespondData(BaseModel): sender: str; receiver: str; action: str
 
-# --- STEAM FRIEND CODE DESTEKLİ ARKADAŞLIK API'LERİ ---
+# --- ARKADAŞLIK VE STEAM KODU API'LERİ ---
 
 @app.post("/api/friends/request")
 def send_friend_request(data: FriendRequestData):
@@ -95,12 +93,9 @@ def send_friend_request(data: FriendRequestData):
     cursor = conn.cursor()
     target_clean = data.target.strip().replace("-", "").replace(" ", "")
 
-    # Hem Kullanıcı Adına (Username) Hem Steam Koduna (Friend Code) bakıyoruz!
     cursor.execute("SELECT username FROM operators WHERE username = ? OR friend_code = ?", (target_clean.upper(), target_clean))
     found_user = cursor.fetchone()
-
     if not found_user:
-        # Eğer büyük harfle bulunamadıysa bir de orijinal haliyle dene
         cursor.execute("SELECT username FROM operators WHERE username = ?", (target_clean,))
         found_user = cursor.fetchone()
 
@@ -109,13 +104,11 @@ def send_friend_request(data: FriendRequestData):
         raise HTTPException(status_code=404, detail="Operatör veya Taktiksel ID bulunamadı!")
     
     receiver_name = found_user[0]
-    
     if data.sender.upper() == receiver_name.upper():
         conn.close()
         raise HTTPException(status_code=400, detail="Kendinize bağlantı isteği gönderemezsiniz!")
 
     try:
-        # Ters yönde istek var mı kontrol et (varsa anında kabul et)
         cursor.execute("SELECT status FROM friends WHERE sender = ? AND receiver = ?", (receiver_name, data.sender))
         rev = cursor.fetchone()
         if rev:
@@ -148,25 +141,19 @@ def respond_friend_request(data: FriendRespondData):
 def get_friends(username: str):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    
     cursor.execute("SELECT friend_code FROM operators WHERE username = ?", (username,))
     my_code_row = cursor.fetchone()
     
-    # --- YENİ OTOMATİK TAMİRCİ (AUTO-HEAL) ---
     if not my_code_row:
-        # Adam yerel veritabanında yoksa (Supabase'den direkt sızdıysa) anında oluştur!
         my_code = str(random.randint(10000000, 99999999))
         cursor.execute("INSERT INTO operators (username, password, friend_code) VALUES (?, ?, ?)", (username, "supabase_secured", my_code))
         conn.commit()
     elif not my_code_row[0] or len(str(my_code_row[0])) < 5:
-        # Adam var ama Steam kodu boş kalmışsa anında yeni kod bas!
         my_code = str(random.randint(10000000, 99999999))
         cursor.execute("UPDATE operators SET friend_code = ? WHERE username = ?", (my_code, username))
         conn.commit()
     else:
-        # Her şey tamamsa kodu al
         my_code = my_code_row[0]
-    # ------------------------------------------
 
     cursor.execute("SELECT sender FROM friends WHERE receiver = ? AND status = 'pending'", (username,))
     incoming_requests = [row[0] for row in cursor.fetchall()]
@@ -198,7 +185,6 @@ def register_operator(data: OperatorAuth):
         cursor.execute("INSERT INTO operators (username, password, friend_code) VALUES (?, ?, ?)", (data.username, data.password, new_code))
         conn.commit()
     except sqlite3.IntegrityError:
-        # Zaten varsa ve kodu yoksa kod ata
         cursor.execute("SELECT friend_code FROM operators WHERE username = ?", (data.username,))
         row = cursor.fetchone()
         if row and not row[0]:
@@ -396,6 +382,7 @@ def get_messages(server_name: str, channel_name: str):
     conn.close()
     return {"status": "success", "messages": [{"name": m[0], "text": m[1], "time": m[2], "type": m[3] if len(m)>3 and m[3] else "chat"} for m in msgs]}
 
+# --- ODA WEBSOCKET YÖNETİCİSİ ---
 class ConnectionManager:
     def __init__(self): self.rooms: Dict[str, Dict[str, WebSocket]] = {}
     async def connect(self, websocket: WebSocket, room_id: str, operator_name: str):
@@ -418,6 +405,59 @@ class ConnectionManager:
             for connection in self.rooms[room_id].values(): await connection.send_text(msg)
 
 manager = ConnectionManager()
+
+# --- YENİ: KİŞİSEL ÇAĞRI VE BİLDİRİM SANTRALİ (GLOBAL USER WEBSOCKET) ---
+class UserConnectionManager:
+    def __init__(self):
+        self.user_sockets: Dict[str, WebSocket] = {}
+    async def connect(self, websocket: WebSocket, username: str):
+        await websocket.accept()
+        self.user_sockets[username] = websocket
+    def disconnect(self, username: str):
+        if username in self.user_sockets:
+            del self.user_sockets[username]
+    async def send_to_user(self, username: str, message: dict):
+        if username in self.user_sockets:
+            try:
+                await self.user_sockets[username].send_text(json.dumps(message))
+            except Exception:
+                pass
+
+user_manager = UserConnectionManager()
+
+@app.websocket("/ws/user/{username}")
+async def user_ws_endpoint(websocket: WebSocket, username: str):
+    await user_manager.connect(websocket, username)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            msg_type = msg.get("type")
+            if msg_type == "call_user":
+                target = msg.get("target")
+                if target in user_manager.user_sockets:
+                    await user_manager.send_to_user(target, {
+                        "type": "incoming_call",
+                        "caller": username,
+                        "dm_room": msg.get("dm_room")
+                    })
+                else:
+                    await user_manager.send_to_user(username, {
+                        "type": "call_response",
+                        "responder": target,
+                        "action": "offline"
+                    })
+            elif msg_type == "call_response":
+                target = msg.get("target")
+                await user_manager.send_to_user(target, {
+                    "type": "call_response",
+                    "responder": username,
+                    "action": msg.get("action")
+                })
+    except WebSocketDisconnect:
+        user_manager.disconnect(username)
+
+# -------------------------------------------------------------
 
 @app.get("/api/servers/{server_name}/generate-invite")
 def generate_invite(server_name: str):
