@@ -12,27 +12,34 @@ from typing import List, Dict, Optional
 import random
 import string
 
-app = FastAPI(title="Karargah Backend v1.7 - Arkadaslik ve DM Altyapisi")
+app = FastAPI(title="Karargah Backend v1.8 - Steam Friend Code Altyapisi")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
+def generate_unique_friend_code(cursor):
+    while True:
+        code = str(random.randint(10000000, 99999999))
+        cursor.execute("SELECT id FROM operators WHERE friend_code = ?", (code,))
+        if not cursor.fetchone():
+            return code
+
 def init_db():
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    cursor.execute("""CREATE TABLE IF NOT EXISTS operators (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, is_prime INTEGER DEFAULT 0, avatar_url TEXT DEFAULT '')""")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS operators (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, is_prime INTEGER DEFAULT 0, avatar_url TEXT DEFAULT '', friend_code TEXT DEFAULT '')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, owner TEXT NOT NULL, icon_url TEXT DEFAULT '', invite_code TEXT DEFAULT '')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, channel_name TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, time_str TEXT NOT NULL, msg_type TEXT DEFAULT 'chat')""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS server_roles (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, username TEXT NOT NULL, role TEXT NOT NULL, UNIQUE(server_name, username))""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, server_name TEXT NOT NULL, channel_name TEXT NOT NULL, channel_type TEXT NOT NULL, UNIQUE(server_name, channel_name, channel_type))""")
-    
-    # YENİ: ARKADAŞLIK VE ÖZEL MESAJ TABLOLARI
     cursor.execute("""CREATE TABLE IF NOT EXISTS friends (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, receiver TEXT NOT NULL, status TEXT DEFAULT 'pending', UNIQUE(sender, receiver))""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS direct_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, receiver TEXT NOT NULL, text TEXT NOT NULL, time_str TEXT NOT NULL, msg_type TEXT DEFAULT 'chat')""")
 
     try: cursor.execute("ALTER TABLE operators ADD COLUMN avatar_url TEXT DEFAULT ''")
+    except: pass
+    try: cursor.execute("ALTER TABLE operators ADD COLUMN friend_code TEXT DEFAULT ''")
     except: pass
     try: cursor.execute("ALTER TABLE servers ADD COLUMN icon_url TEXT DEFAULT ''")
     except: pass
@@ -40,6 +47,14 @@ def init_db():
     except: pass
     try: cursor.execute("ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT 'chat'")
     except: pass
+
+    # Mevcut operatörlere (AKIN, AKINTO vs.) kodu yoksa otomatik 8 haneli Steam ID basıyoruz!
+    cursor.execute("SELECT id, username, friend_code FROM operators")
+    users = cursor.fetchall()
+    for u in users:
+        if not u[2] or len(str(u[2])) < 5:
+            new_code = generate_unique_friend_code(cursor)
+            cursor.execute("UPDATE operators SET friend_code = ? WHERE id = ?", (new_code, u[0]))
 
     cursor.execute("SELECT COUNT(*) FROM servers")
     if cursor.fetchone()[0] == 0: cursor.execute("INSERT INTO servers (name, owner) VALUES ('KUZEY KARTALLARI', 'AKIN')")
@@ -69,43 +84,53 @@ class JoinServerData(BaseModel): username: str; invite_code: str
 class ChannelCreate(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
 class ChannelDelete(BaseModel): server_name: str; channel_name: str; channel_type: str; operator_name: str
 
-# YENİ: ARKADAŞLIK SİSTEMİ MODELLERİ
-class FriendRequestData(BaseModel): sender: str; receiver: str
-class FriendRespondData(BaseModel): sender: str; receiver: str; action: str # 'accept' veya 'reject'
+class FriendRequestData(BaseModel): sender: str; target: str # İster İsim, İster 8 Haneli Kod
+class FriendRespondData(BaseModel): sender: str; receiver: str; action: str
 
-# --- YENİ ARKADAŞLIK API'LERİ ---
+# --- STEAM FRIEND CODE DESTEKLİ ARKADAŞLIK API'LERİ ---
 
 @app.post("/api/friends/request")
 def send_friend_request(data: FriendRequestData):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    # Hedef kişi sistemde var mı?
-    cursor.execute("SELECT id FROM operators WHERE username = ?", (data.receiver,))
-    if not cursor.fetchone():
+    target_clean = data.target.strip().replace("-", "").replace(" ", "")
+
+    # Hem Kullanıcı Adına (Username) Hem Steam Koduna (Friend Code) bakıyoruz!
+    cursor.execute("SELECT username FROM operators WHERE username = ? OR friend_code = ?", (target_clean.upper(), target_clean))
+    found_user = cursor.fetchone()
+
+    if not found_user:
+        # Eğer büyük harfle bulunamadıysa bir de orijinal haliyle dene
+        cursor.execute("SELECT username FROM operators WHERE username = ?", (target_clean,))
+        found_user = cursor.fetchone()
+
+    if not found_user:
         conn.close()
-        raise HTTPException(status_code=404, detail="Böyle bir operatör bulunamadı!")
+        raise HTTPException(status_code=404, detail="Operatör veya Taktiksel ID bulunamadı!")
     
-    if data.sender == data.receiver:
+    receiver_name = found_user[0]
+    
+    if data.sender.upper() == receiver_name.upper():
         conn.close()
-        raise HTTPException(status_code=400, detail="Kendinize istek gönderemezsiniz!")
+        raise HTTPException(status_code=400, detail="Kendinize bağlantı isteği gönderemezsiniz!")
 
     try:
-        # Önce ters yönde (onun sana attığı) bir istek var mı bak, varsa direkt kabul et!
-        cursor.execute("SELECT status FROM friends WHERE sender = ? AND receiver = ?", (data.receiver, data.sender))
-        existing_reverse = cursor.fetchone()
-        if existing_reverse:
-            cursor.execute("UPDATE friends SET status = 'accepted' WHERE sender = ? AND receiver = ?", (data.receiver, data.sender))
+        # Ters yönde istek var mı kontrol et (varsa anında kabul et)
+        cursor.execute("SELECT status FROM friends WHERE sender = ? AND receiver = ?", (receiver_name, data.sender))
+        rev = cursor.fetchone()
+        if rev:
+            cursor.execute("UPDATE friends SET status = 'accepted' WHERE sender = ? AND receiver = ?", (receiver_name, data.sender))
             conn.commit()
             conn.close()
-            return {"status": "success", "message": "Arkadaşlık karşılıklı onaylandı!"}
+            return {"status": "success", "message": f"{receiver_name} ile bağlantı kuruldu!"}
 
-        cursor.execute("INSERT INTO friends (sender, receiver, status) VALUES (?, ?, 'pending')", (data.sender, data.receiver))
+        cursor.execute("INSERT INTO friends (sender, receiver, status) VALUES (?, ?, 'pending')", (data.sender, receiver_name))
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
-        raise HTTPException(status_code=400, detail="Zaten bir istek gönderilmiş veya arkadaşsınız!")
+        raise HTTPException(status_code=400, detail="Bu operatörle zaten bağlantınız var veya bekleyen bir istek mevcut!")
     finally: conn.close()
-    return {"status": "success", "message": "İstek gönderildi."}
+    return {"status": "success", "message": f"{receiver_name} adlı operatöre istek iletildi."}
 
 @app.post("/api/friends/respond")
 def respond_friend_request(data: FriendRespondData):
@@ -124,11 +149,14 @@ def get_friends(username: str):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
     
-    # 1. Gelen Bekleyen İstekler (Bana atılanlar)
+    # Kendi friend_code'umuzu çekelim
+    cursor.execute("SELECT friend_code FROM operators WHERE username = ?", (username,))
+    my_code_row = cursor.fetchone()
+    my_code = my_code_row[0] if my_code_row and my_code_row[0] else "---"
+
     cursor.execute("SELECT sender FROM friends WHERE receiver = ? AND status = 'pending'", (username,))
     incoming_requests = [row[0] for row in cursor.fetchall()]
     
-    # 2. Kabul Edilmiş Arkadaşlar (Benim attığım veya bana atılan onaylılar)
     cursor.execute("""
         SELECT receiver FROM friends WHERE sender = ? AND status = 'accepted'
         UNION
@@ -136,18 +164,37 @@ def get_friends(username: str):
     """, (username, username))
     accepted_friends = [row[0] for row in cursor.fetchall()]
     
-    # Arkadaşların profillerini (avatar ve prime durumu) çek
     friends_data = []
     for f_name in accepted_friends:
-        cursor.execute("SELECT avatar_url, is_prime FROM operators WHERE username = ?", (f_name,))
+        cursor.execute("SELECT avatar_url, is_prime, friend_code FROM operators WHERE username = ?", (f_name,))
         res = cursor.fetchone()
         is_prime = 1 if f_name == "AKIN" else (res[1] if res else 0)
-        friends_data.append({"username": f_name, "avatar_url": res[0] if res else "", "is_prime": is_prime})
+        f_code = res[2] if res and res[2] else ""
+        friends_data.append({"username": f_name, "avatar_url": res[0] if res else "", "is_prime": is_prime, "friend_code": f_code})
         
     conn.close()
-    return {"status": "success", "incoming_requests": incoming_requests, "friends": friends_data}
+    return {"status": "success", "my_friend_code": my_code, "incoming_requests": incoming_requests, "friends": friends_data}
 
-# --------------------------------
+@app.post("/api/register")
+def register_operator(data: OperatorAuth):
+    conn = sqlite3.connect("karargah.db")
+    cursor = conn.cursor()
+    try:
+        new_code = generate_unique_friend_code(cursor)
+        cursor.execute("INSERT INTO operators (username, password, friend_code) VALUES (?, ?, ?)", (data.username, data.password, new_code))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Zaten varsa ve kodu yoksa kod ata
+        cursor.execute("SELECT friend_code FROM operators WHERE username = ?", (data.username,))
+        row = cursor.fetchone()
+        if row and not row[0]:
+            new_code = generate_unique_friend_code(cursor)
+            cursor.execute("UPDATE operators SET friend_code = ? WHERE username = ?", (new_code, data.username))
+            conn.commit()
+    finally: conn.close()
+    return {"status": "success"}
+
+# --- STANDART API'LER ---
 
 @app.post("/api/shopier-webhook")
 async def shopier_webhook(request: Request):
@@ -216,12 +263,12 @@ def update_profile(data: ProfileUpdate):
 def get_profile(username: str):
     conn = sqlite3.connect("karargah.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT avatar_url, is_prime FROM operators WHERE username = ?", (username,))
+    cursor.execute("SELECT avatar_url, is_prime, friend_code FROM operators WHERE username = ?", (username,))
     result = cursor.fetchone()
     conn.close()
     if result: 
         is_prime = 1 if username == "AKIN" else result[1]
-        return {"status": "success", "avatar_url": result[0], "is_prime": is_prime}
+        return {"status": "success", "avatar_url": result[0], "is_prime": is_prime, "friend_code": result[2]}
     return {"status": "error"}
 
 @app.post("/api/server/role")
@@ -243,17 +290,6 @@ def get_server_roles(server_name: str):
     roles = cursor.fetchall()
     conn.close()
     return {"status": "success", "roles": {r[0]: r[1] for r in roles}}
-
-@app.post("/api/register")
-def register_operator(data: OperatorAuth):
-    conn = sqlite3.connect("karargah.db")
-    cursor = conn.cursor()
-    try:
-        cursor.execute("INSERT INTO operators (username, password) VALUES (?, ?)", (data.username, data.password))
-        conn.commit()
-    except sqlite3.IntegrityError: pass 
-    finally: conn.close()
-    return {"status": "success"}
 
 @app.post("/api/servers")
 def create_server(data: ServerCreate):
