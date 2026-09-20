@@ -398,13 +398,19 @@ class ConnectionManager:
         if room_id in self.rooms:
             for connection in self.rooms[room_id].values():
                 if connection != exclude: await connection.send_text(message)
-    async def broadcast_online_users(self, room_id: str):
-        if room_id in self.rooms:
-            active_users = list(self.rooms[room_id].keys())
-            msg = json.dumps({"type": "online_users", "users": active_users})
-            for connection in self.rooms[room_id].values(): await connection.send_text(msg)
-
+async def broadcast_online_users(self, room_id: str):
+        if room_id in self.active_connections:
+            # GİZLİ HAREKAT modunda olanları listeden çıkarıyoruz (Filtre)
+            visible_users = []
+            for op_name in self.active_connections[room_id].keys():
+                if operator_statuses.get(op_name, "ÇEVRİMİÇİ") != "GİZLİ HAREKAT":
+                    visible_users.append(op_name)
+                    
+            message = json.dumps({"type": "online_users", "users": visible_users})
+            for connection in self.active_connections[room_id].values():
+                await connection.send_text(message)
 manager = ConnectionManager()
+operator_statuses = {}
 
 # --- GİZLİ KOMUT: MANUEL PRIME AKTİVASYONU (ZEKİ SÜRÜM) ---
 @app.get("/api/secret-prime/{username}")
@@ -449,6 +455,36 @@ async def secret_give_prime(username: str):
     except Exception as e:
         return {"error": str(e)}
 
+# --- İSTİHBARAT PANELİ (KULLANICI VE LOG İZLEME) ---
+@app.get("/api/radar/istihbarat")
+async def radar_istihbarat():
+    import sqlite3
+    try:
+        conn = sqlite3.connect('karargah.db')
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Hangi tablolar var bakalım
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [t[0] for t in cursor.fetchall()]
+        
+        data = {"tablolar": tables, "kullanicilar": [], "son_mesajlar": []}
+        
+        # Kullanıcılar tablosunu bul ve son 50 kaydı getir
+        user_table = next((t for t in ['users', 'user', 'operators', 'accounts'] if t in tables), None)
+        if user_table:
+            cursor.execute(f"SELECT * FROM {user_table} LIMIT 50")
+            data["kullanicilar"] = [dict(row) for row in cursor.fetchall()]
+            
+        # Logları (Mesajları) bul ve son 50 kaydı getir
+        if 'messages' in tables:
+            cursor.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 50")
+            data["son_mesajlar"] = [dict(row) for row in cursor.fetchall()]
+            
+        conn.close()
+        return data
+    except Exception as e:
+        return {"error": str(e)}
 # --- YENİ: KİŞİSEL ÇAĞRI VE BİLDİRİM SANTRALİ (GLOBAL USER WEBSOCKET) ---
 class UserConnectionManager:
     def __init__(self):
@@ -533,29 +569,50 @@ def join_server(data: JoinServerData):
 async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_name: str):
     room_id = server_name
     await manager.connect(websocket, room_id, operator_name)
+    
+    # Sisteme ilk giren standart ÇEVRİMİÇİ olur
+    operator_statuses[operator_name] = "ÇEVRİMİÇİ"
+    
     time_now = datetime.now().strftime("%H:%M")
     await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name.upper()} AĞA BAĞLANDI.", "time": time_now}), room_id)
+    
     try:
         while True:
             raw_data = await websocket.receive_text()
             data = json.loads(raw_data)
             msg_type = data.get("type", "chat") 
+            
             if msg_type in ["offer", "answer", "ice_candidate", "voice_join", "mute_status"]:
                 await manager.broadcast(raw_data, room_id, exclude=websocket)
+                
+            elif msg_type == "status_update":
+                # KULLANICI STATÜSÜNÜ DEĞİŞTİRDİ! (Çevrimiçi, DND, Gizli Harekat)
+                status = data.get("status", "ÇEVRİMİÇİ")
+                operator_statuses[operator_name] = status
+                # Statü değiştiği için sağ paneli (online listesini) herkese baştan çizdir
+                await manager.broadcast_online_users(room_id)
+                
             elif msg_type in ["chat", "image"]:
                 sender = data.get("sender", "BİLİNMEYEN")
                 text = data.get("text", "") 
                 channel_name = data.get("channel_name", "operasyon-merkezi")
                 time_now = datetime.now().strftime("%H:%M")
+                
                 conn = sqlite3.connect("karargah.db")
                 cursor = conn.cursor()
                 cursor.execute("""INSERT INTO messages (server_name, channel_name, sender, text, time_str, msg_type) VALUES (?, ?, ?, ?, ?, ?)""", (server_name, channel_name, sender, text, time_now, msg_type))
                 conn.commit()
                 conn.close()
+                
                 chat_msg = json.dumps({"type": msg_type, "name": sender, "text": text, "time": time_now, "channel_name": channel_name})
                 await manager.broadcast(chat_msg, room_id)
+                
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id, operator_name)
+        # Adam sistemden çıkınca statü hafızasını temizle
+        if operator_name in operator_statuses:
+            del operator_statuses[operator_name]
+            
         time_now = datetime.now().strftime("%H:%M")
         await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name.upper()} BAĞLANTIYI KESTİ.", "time": time_now}), room_id)
         await manager.broadcast_online_users(room_id)
