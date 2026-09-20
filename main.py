@@ -6,11 +6,17 @@ import string
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from typing import Dict, List
+import os
+import shutil
+import uuid
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
+# Yüklenen dosyaları barındıracak klasörü oluştur ve dışa aç
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 # --- VERİTABANI KURULUMU ---
 def init_db():
     conn = sqlite3.connect("karargah.db")
@@ -248,7 +254,21 @@ async def gen_invite(server_name: str):
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    return {"url": "https://karargah.stratr.com.tr/assets/default_image.jpg"} # Gerçek sunucuda burası bulut depolamaya gidecek
+    try:
+        # Resmi benzersiz bir isimle kaydet (çakışma olmasın diye)
+        ext = file.filename.split('.')[-1]
+        new_filename = f"{uuid.uuid4().hex}.{ext}"
+        file_location = f"uploads/{new_filename}"
+        
+        # Dosyayı sunucuya fiziksel olarak yaz
+        with open(file_location, "wb+") as file_object:
+            shutil.copyfileobj(file.file, file_object)
+            
+        # Flutter'ın okuyabileceği gerçek canlı linki oluştur
+        file_url = f"https://karargah-backend-production.up.railway.app/uploads/{new_filename}"
+        return {"url": file_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Görsel yüklenemedi!")
 
 @app.get("/api/friends/{username}")
 async def get_friends(username: str):
