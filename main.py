@@ -406,6 +406,20 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# --- GİZLİ KOMUT: MANUEL PRIME AKTİVASYONU ---
+@app.get("/api/secret-prime/{username}")
+async def secret_give_prime(username: str):
+    try:
+        conn = sqlite3.connect('karargah.db')
+        cursor = conn.cursor()
+        # Kullanıcıyı bul ve is_prime değerini 1 yap
+        cursor.execute("UPDATE users SET is_prime = 1 WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+        return {"status": "success", "message": f"Tebrikler, {username} artık KARARGAH PRIME statüsünde!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- YENİ: KİŞİSEL ÇAĞRI VE BİLDİRİM SANTRALİ (GLOBAL USER WEBSOCKET) ---
 class UserConnectionManager:
     def __init__(self):
