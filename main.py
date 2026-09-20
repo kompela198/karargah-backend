@@ -252,14 +252,32 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.get("/api/friends/{username}")
 async def get_friends(username: str):
+    import random, string
     db = get_db()
+    
+    # 1. Veritabanında kullanıcıyı kontrol et
     user = db.execute("SELECT friend_code FROM users WHERE username = ?", (username,)).fetchone()
-    my_code = user["friend_code"] if user and user["friend_code"] else "10000000"
+    
+    # 2. Eğer kullanıcının Taktiksel ID'si zaten varsa onu kullan
+    if user and user["friend_code"]:
+        my_code = user["friend_code"]
+    else:
+        # YOKSA: Rastgele 8 haneli yepyeni bir Taktiksel ID üret
+        my_code = ''.join(random.choices(string.digits, k=8))
+        
+        # Kullanıcı hiç kayıtlı değilse sisteme kaydet
+        db.execute("INSERT OR IGNORE INTO users (username, avatar_url, is_prime, friend_code) VALUES (?, '', 0, ?)", (username, my_code))
+        
+        # Kullanıcı kayıtlı ama ID'si boş kalmışsa, ID'sini güncelle
+        db.execute("UPDATE users SET friend_code = ? WHERE username = ?", (my_code, username))
+        db.commit()
+        
+    # Arkadaşlık isteklerini ve listesini çek
     reqs = db.execute("SELECT user1 FROM friends WHERE user2 = ? AND status = 'pending'", (username,)).fetchall()
     friends = db.execute("SELECT u.username, u.avatar_url FROM friends f JOIN users u ON (f.user1 = u.username OR f.user2 = u.username) WHERE (f.user1 = ? OR f.user2 = ?) AND f.status = 'accepted' AND u.username != ?", (username, username, username)).fetchall()
     db.close()
+    
     return {"my_friend_code": my_code, "incoming_requests": [r["user1"] for r in reqs], "friends": [dict(f) for f in friends]}
-
 @app.post("/api/friends/request")
 async def add_friend(data: dict):
     db = get_db()
