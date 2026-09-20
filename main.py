@@ -406,19 +406,48 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# --- GİZLİ KOMUT: MANUEL PRIME AKTİVASYONU ---
+# --- GİZLİ KOMUT: MANUEL PRIME AKTİVASYONU (ZEKİ SÜRÜM) ---
 @app.get("/api/secret-prime/{username}")
 async def secret_give_prime(username: str):
+    import sqlite3
     try:
         conn = sqlite3.connect('karargah.db')
         cursor = conn.cursor()
-        # Kullanıcıyı bul ve is_prime değerini 1 yap
-        cursor.execute("UPDATE users SET is_prime = 1 WHERE username = ?", (username,))
+        
+        # 1. Hangi tablo kullanılıyor otomatik bulalım
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [t[0] for t in cursor.fetchall()]
+        
+        table_name = None
+        for t in ['users', 'user', 'operators', 'operator', 'accounts']:
+            if t in tables:
+                table_name = t
+                break
+                
+        if not table_name:
+            return {"error": f"Tablo bulunamadı! Mevcut tablolar: {tables}"}
+            
+        # 2. is_prime sütunu var mı kontrol et, yoksa ekle (Otomatik Göç)
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = [c[1] for c in cursor.fetchall()]
+        
+        if "is_prime" not in columns:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN is_prime INTEGER DEFAULT 0")
+            
+        # Kullanıcı adı sütununu bul
+        user_col = "username"
+        if "username" not in columns:
+            if "operator_name" in columns: user_col = "operator_name"
+            elif "name" in columns: user_col = "name"
+            
+        # 3. Prime yetkisini bas!
+        cursor.execute(f"UPDATE {table_name} SET is_prime = 1 WHERE {user_col} = ?", (username,))
         conn.commit()
         conn.close()
-        return {"status": "success", "message": f"Tebrikler, {username} artık KARARGAH PRIME statüsünde!"}
+        
+        return {"status": "success", "message": f"Tebrikler! {username} artık PRIME statüsünde. (Hedef Tablo: {table_name})"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"error": str(e)}
 
 # --- YENİ: KİŞİSEL ÇAĞRI VE BİLDİRİM SANTRALİ (GLOBAL USER WEBSOCKET) ---
 class UserConnectionManager:
