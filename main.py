@@ -120,20 +120,39 @@ async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_na
 async def websocket_user_endpoint(websocket: WebSocket, operator_name: str):
     await websocket.accept()
     manager.user_connections[operator_name] = websocket
+    
+    # Yeni bağlanan operatörün durumunu bildir
+    my_status = operator_statuses.get(operator_name, "ÇEVRİMİÇİ")
+    for op, conn in list(manager.user_connections.items()):
+        if op != operator_name:
+            try: await conn.send_text(json.dumps({"type": "friend_status", "operator": operator_name, "is_online": my_status != "GİZLİ HAREKAT", "status": my_status}))
+            except: pass
+            
     try:
         while True:
             raw_data = await websocket.receive_text()
             data = json.loads(raw_data)
-            if data.get("type") == "call_user":
+            msg_type = data.get("type")
+            if msg_type == "call_user":
                 target = data.get("target")
                 if target in manager.user_connections:
                     await manager.user_connections[target].send_text(json.dumps({"type": "incoming_call", "caller": operator_name, "dm_room": data.get("dm_room")}))
-            elif data.get("type") == "call_response":
+            elif msg_type == "call_response":
                 target = data.get("target")
                 if target in manager.user_connections:
                     await manager.user_connections[target].send_text(json.dumps({"type": "call_response", "responder": operator_name, "action": data.get("action")}))
+            elif msg_type == "status_update":
+                st = data.get("status", "ÇEVRİMİÇİ")
+                operator_statuses[operator_name] = st
+                for op, conn in list(manager.user_connections.items()):
+                    if op != operator_name:
+                        try: await conn.send_text(json.dumps({"type": "friend_status", "operator": operator_name, "is_online": st != "GİZLİ HAREKAT", "status": st}))
+                        except: pass
     except WebSocketDisconnect:
         if operator_name in manager.user_connections: del manager.user_connections[operator_name]
+        for op, conn in list(manager.user_connections.items()):
+            try: await conn.send_text(json.dumps({"type": "friend_status", "operator": operator_name, "is_online": False, "status": "ÇEVRİMDIŞI"}))
+            except: pass
 
 
 # --- REST API UÇ NOKTALARI ---
@@ -297,7 +316,20 @@ async def get_friends(username: str):
     friends = db.execute("SELECT u.username, u.avatar_url FROM friends f JOIN users u ON (f.user1 = u.username OR f.user2 = u.username) WHERE (f.user1 = ? OR f.user2 = ?) AND f.status = 'accepted' AND u.username != ?", (username, username, username)).fetchall()
     db.close()
     
-    return {"my_friend_code": my_code, "incoming_requests": [r["user1"] for r in reqs], "friends": [dict(f) for f in friends]}
+    friends_data = []
+    for f in friends:
+        item = dict(f)
+        u_name = item["username"]
+        is_conn = u_name in manager.user_connections
+        st = operator_statuses.get(u_name, "ÇEVRİMİÇİ") if is_conn else "ÇEVRİMDIŞI"
+        if st == "GİZLİ HAREKAT":
+            is_conn = False
+            st = "ÇEVRİMDIŞI"
+        item["is_online"] = is_conn
+        item["status"] = st
+        friends_data.append(item)
+    
+    return {"my_friend_code": my_code, "incoming_requests": [r["user1"] for r in reqs], "friends": friends_data}
 @app.post("/api/friends/request")
 async def add_friend(data: dict):
     db = get_db()
@@ -316,6 +348,17 @@ async def res_friend(data: dict):
     db.commit()
     db.close()
     return {"status": "success"}
+
+@app.post("/api/friends/remove")
+async def remove_friend(data: dict):
+    db = get_db()
+    u1 = data.get("user1")
+    u2 = data.get("user2")
+    if u1 and u2:
+        db.execute("DELETE FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)", (u1, u2, u2, u1))
+        db.commit()
+    db.close()
+    return {"status": "success", "message": "Operatör bağlantısı kesildi."}
 
 # --- GİZLİ KOMUT: MANUEL PRIME AKTİVASYONU (ZEKİ SÜRÜM) ---
 @app.get("/api/secret-prime/{username}")
