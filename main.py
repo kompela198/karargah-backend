@@ -4,7 +4,7 @@ import sqlite3
 import random
 import string
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from typing import Dict, List
@@ -380,8 +380,31 @@ async def gen_invite(server_name: str):
     db.close()
     return {"invite_code": invite}
 
+def public_base_url(request: Request) -> str:
+    # PUBLIC_URL ortam değişkeni varsa onu kullan; yoksa isteğin geldiği adresten türet
+    # (Cloudflare Tunnel / Railway gibi proxy'ler X-Forwarded-Proto ve Host başlıklarını geçirir)
+    env = os.environ.get("PUBLIC_URL")
+    if env:
+        return env.rstrip("/")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", request.url.netloc)
+    return f"{proto}://{host}"
+
+@app.post("/api/register")
+async def register(data: dict):
+    # Giriş ekranı kayıt sonrası bu ucu çağırıyordu ama backend'de yoktu (404 sessizce yutuluyordu)
+    username = (data.get("username") or "").strip()
+    if not username:
+        raise HTTPException(400, "Kullanıcı adı gerekli.")
+    db = get_db()
+    db.execute("INSERT OR IGNORE INTO users (username, avatar_url, is_prime, friend_code) VALUES (?, '', 0, ?)",
+               (username, ''.join(random.choices(string.digits, k=8))))
+    db.commit()
+    db.close()
+    return {"status": "success"}
+
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(request: Request, file: UploadFile = File(...)):
     try:
         # Resmi benzersiz bir isimle kaydet (çakışma olmasın diye)
         ext = file.filename.split('.')[-1]
@@ -393,7 +416,7 @@ async def upload_file(file: UploadFile = File(...)):
             shutil.copyfileobj(file.file, file_object)
             
         # Flutter'ın okuyabileceği gerçek canlı linki oluştur
-        file_url = f"https://karargah-backend-production.up.railway.app/uploads/{new_filename}"
+        file_url = f"{public_base_url(request)}/uploads/{new_filename}"
         return {"url": file_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Görsel yüklenemedi!")
