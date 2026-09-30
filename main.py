@@ -11,6 +11,7 @@ from typing import Dict, List
 import os
 import shutil
 import uuid
+import asyncio
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -33,31 +34,57 @@ def init_db():
 init_db()
 
 # --- WEBSOCKET MİMARİSİ VE HAYALET MODU HAFIZASI ---
-operator_statuses = {} 
+operator_statuses = {}
+
+# İstemciden gelip odaya aktarılan (relay) mesaj tipleri.
+# NOT: Eskiden voice_ack / voice_leave / role_update / avatar_update / server_update
+# burada yoktu ve sunucu bunları sessizce yutuyordu -> ses bağlantısı bazen hiç kurulmuyordu.
+RELAY_TYPES = {"offer", "answer", "ice_candidate", "voice_join", "voice_ack", "voice_leave",
+               "mute_status", "role_update", "avatar_update", "server_update"}
 
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, Dict[str, WebSocket]] = {}
         self.user_connections: Dict[str, WebSocket] = {}
+        # Oda başına: operatör -> bulunduğu ses kanalı (sunucu tarafı takip)
+        self.voice_members: Dict[str, Dict[str, str]] = {}
 
     async def connect(self, websocket: WebSocket, room_id: str, operator_name: str):
         await websocket.accept()
-        if room_id not in self.active_connections:
-            self.active_connections[room_id] = {}
-        self.active_connections[room_id][operator_name] = websocket
+        room = self.active_connections.setdefault(room_id, {})
+        old = room.get(operator_name)
+        room[operator_name] = websocket
+        # Aynı isimle yeni bağlantı geldiyse (yeniden bağlanma / ikinci sekme) eskisini kapat
+        if old is not None and old is not websocket:
+            try: await old.close(code=4000)
+            except Exception: pass
 
-    def disconnect(self, websocket: WebSocket, room_id: str, operator_name: str):
-        if room_id in self.active_connections and operator_name in self.active_connections[room_id]:
-            del self.active_connections[room_id][operator_name]
-            if not self.active_connections[room_id]:
-                del self.active_connections[room_id]
+    def disconnect(self, websocket: WebSocket, room_id: str, operator_name: str) -> bool:
+        # Sadece bu socket hâlâ kayıtlıysa sil. Eski socket geç kapanırsa yeni bağlantıyı
+        # silmesin (önceki kodda kullanıcı "bağlı görünüp" hiçbir sinyal alamıyordu).
+        room = self.active_connections.get(room_id)
+        if not room or room.get(operator_name) is not websocket:
+            return False
+        del room[operator_name]
+        if not room:
+            del self.active_connections[room_id]
+        return True
+
+    async def safe_send(self, ws: WebSocket, message: str):
+        try: await ws.send_text(message)
+        except Exception: pass
 
     async def broadcast(self, message: str, room_id: str, exclude: WebSocket = None):
         if room_id in self.active_connections:
             for connection in list(self.active_connections[room_id].values()):
-                if connection != exclude:
-                    try: await connection.send_text(message)
-                    except: pass
+                if connection is not exclude:
+                    await self.safe_send(connection, message)
+
+    async def send_to(self, message: str, room_id: str, target: str) -> bool:
+        ws = self.active_connections.get(room_id, {}).get(target)
+        if ws is None: return False
+        await self.safe_send(ws, message)
+        return True
 
     async def broadcast_online_users(self, room_id: str):
         if room_id in self.active_connections:
@@ -83,23 +110,48 @@ async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_na
     time_now = datetime.now().strftime("%H:%M")
     await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name.upper()} AĞA BAĞLANDI.", "time": time_now}), server_name)
     await manager.broadcast_online_users(server_name)
-    
+    # Yeni gelen, odada kimin hangi ses kanalında olduğunu hemen görsün
+    for op, ch in list(manager.voice_members.get(server_name, {}).items()):
+        if op != operator_name:
+            await manager.safe_send(websocket, json.dumps({"type": "voice_join", "sender": op, "voice_channel": ch, "announce": True}))
+
     try:
         while True:
             raw_data = await websocket.receive_text()
-            data = json.loads(raw_data)
-            msg_type = data.get("type", "chat") 
-            
-            if msg_type in ["offer", "answer", "ice_candidate", "voice_join", "mute_status"]:
-                await manager.broadcast(raw_data, server_name, exclude=websocket)
-            
+            try:
+                data = json.loads(raw_data)
+            except Exception:
+                continue  # bozuk mesaj bağlantıyı düşürmesin
+            if not isinstance(data, dict):
+                continue
+            msg_type = data.get("type", "chat")
+
+            if msg_type == "ping":
+                await manager.safe_send(websocket, json.dumps({"type": "pong"}))
+                continue
+
+            if msg_type in RELAY_TYPES:
+                # Kimlik sahteciliğini engelle: gönderen her zaman bu socket'in sahibi
+                data["sender"] = operator_name
+                if msg_type == "voice_join":
+                    manager.voice_members.setdefault(server_name, {})[operator_name] = data.get("voice_channel", "")
+                elif msg_type == "voice_leave":
+                    manager.voice_members.get(server_name, {}).pop(operator_name, None)
+                out = json.dumps(data)
+                target = data.get("target")
+                if target:
+                    # offer/answer/ice/voice_ack sadece hedefe gitsin (herkese yayma)
+                    await manager.send_to(out, server_name, target)
+                else:
+                    await manager.broadcast(out, server_name, exclude=websocket)
+
             elif msg_type == "status_update":
                 operator_statuses[operator_name] = data.get("status", "ÇEVRİMİÇİ")
                 await manager.broadcast_online_users(server_name)
-                
+
             elif msg_type in ["chat", "image"]:
-                sender = data.get("sender", "BİLİNMEYEN")
-                text = data.get("text", "") 
+                sender = operator_name
+                text = str(data.get("text", ""))[:4000]
                 channel_name = data.get("channel_name", "operasyon-merkezi")
                 time_now = datetime.now().strftime("%H:%M")
                 
@@ -110,11 +162,57 @@ async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_na
                 await manager.broadcast(json.dumps({"type": msg_type, "name": sender, "text": text, "time": time_now, "channel_name": channel_name}), server_name)
                 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, server_name, operator_name)
-        if operator_name in operator_statuses: del operator_statuses[operator_name]
-        time_now = datetime.now().strftime("%H:%M")
-        await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name.upper()} BAĞLANTIYI KESTİ.", "time": time_now}), server_name)
-        await manager.broadcast_online_users(server_name)
+        pass
+    except Exception:
+        # Önceden sadece WebSocketDisconnect yakalanıyordu; başka bir hata olursa
+        # kullanıcı listede "hayalet" olarak kalıyordu.
+        pass
+    finally:
+        if manager.disconnect(websocket, server_name, operator_name):
+            # Ses kanalındaysa diğerleri eş bağlantısını hemen temizlesin
+            if manager.voice_members.get(server_name, {}).pop(operator_name, None) is not None:
+                await manager.broadcast(json.dumps({"type": "voice_leave", "sender": operator_name}), server_name)
+            if not manager.voice_members.get(server_name):
+                manager.voice_members.pop(server_name, None)
+            still_here = any(operator_name in room for room in manager.active_connections.values())
+            if not still_here and operator_name not in manager.user_connections:
+                operator_statuses.pop(operator_name, None)
+            time_now = datetime.now().strftime("%H:%M")
+            await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name.upper()} BAĞLANTIYI KESTİ.", "time": time_now}), server_name)
+            await manager.broadcast_online_users(server_name)
+
+# --- TURN SUNUCUSU (NAT/CGNAT arkasındaki kullanıcılar için ses rölesi) ---
+# Railway ortam değişkenleriyle ayarlanır:
+#   Cloudflare Realtime TURN:  CF_TURN_KEY_ID, CF_TURN_API_TOKEN
+#   veya herhangi bir TURN:     TURN_URLS (virgülle ayrılmış), TURN_USERNAME, TURN_CREDENTIAL
+DEFAULT_ICE = [{"urls": ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"]}]
+
+def _fetch_cloudflare_ice():
+    import urllib.request
+    key_id = os.environ["CF_TURN_KEY_ID"]
+    token = os.environ["CF_TURN_API_TOKEN"]
+    req = urllib.request.Request(
+        f"https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}/credentials/generate-ice-servers",
+        data=json.dumps({"ttl": 86400}).encode(), method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        body = json.loads(r.read())
+    servers = body.get("iceServers", [])
+    return servers if isinstance(servers, list) else [servers]
+
+@app.get("/api/ice-servers")
+async def ice_servers():
+    try:
+        if os.environ.get("CF_TURN_KEY_ID") and os.environ.get("CF_TURN_API_TOKEN"):
+            return {"iceServers": await asyncio.to_thread(_fetch_cloudflare_ice)}
+        if os.environ.get("TURN_URLS"):
+            turn = {"urls": [u.strip() for u in os.environ["TURN_URLS"].split(",") if u.strip()],
+                    "username": os.environ.get("TURN_USERNAME", ""),
+                    "credential": os.environ.get("TURN_CREDENTIAL", "")}
+            return {"iceServers": DEFAULT_ICE + [turn]}
+    except Exception as e:
+        print("TURN kimlik bilgisi alınamadı:", e)
+    return {"iceServers": DEFAULT_ICE}
 
 @app.websocket("/ws/user/{operator_name}")
 async def websocket_user_endpoint(websocket: WebSocket, operator_name: str):
@@ -252,11 +350,22 @@ async def assign_role(data: dict):
     db.close()
     return {"status": "success"}
 
+@app.post("/api/update-server-icon")
+async def update_server_icon(data: dict):
+    # İstemci bu ucu çağırıyordu ama backend'de yoktu (logo güncelleme hiç çalışmıyordu)
+    db = get_db()
+    db.execute("UPDATE servers SET icon_url = ? WHERE name = ?", (data.get("icon_url", ""), data.get("server_name", "")))
+    db.commit()
+    db.close()
+    return {"status": "success"}
+
 @app.post("/api/join-server")
 async def join_server(data: dict):
     db = get_db()
     server = db.execute("SELECT name FROM servers WHERE invite_code = ?", (data["invite_code"],)).fetchone()
-    if not server: raise HTTPException(400, "Geçersiz davet kodu.")
+    if not server:
+        db.close()
+        raise HTTPException(400, "Geçersiz davet kodu.")
     db.execute("INSERT OR IGNORE INTO server_members (server_name, username, role) VALUES (?, ?, 'OPERATÖR')", (server["name"], data["username"]))
     db.commit()
     db.close()
@@ -361,8 +470,17 @@ async def remove_friend(data: dict):
     return {"status": "success", "message": "Operatör bağlantısı kesildi."}
 
 # --- GİZLİ KOMUT: MANUEL PRIME AKTİVASYONU (ZEKİ SÜRÜM) ---
+def _require_admin(key: str):
+    # Eskiden bu uçlar herkese açıktı: linki bilen herkes kendine Prime verebiliyor,
+    # tüm kullanıcıları ve mesajları okuyabiliyordu. Railway'de ADMIN_KEY tanımla,
+    # sonra ?key=... ile çağır. ADMIN_KEY yoksa uç tamamen kapalı.
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not admin_key or key != admin_key:
+        raise HTTPException(404, "Not Found")
+
 @app.get("/api/secret-prime/{username}")
-async def secret_give_prime(username: str):
+async def secret_give_prime(username: str, key: str = ""):
+    _require_admin(key)
     try:
         conn = sqlite3.connect('karargah.db')
         cursor = conn.cursor()
@@ -384,7 +502,8 @@ async def secret_give_prime(username: str):
 
 # --- İSTİHBARAT PANELİ (KULLANICI VE LOG İZLEME) ---
 @app.get("/api/radar/istihbarat")
-async def radar_istihbarat():
+async def radar_istihbarat(key: str = ""):
+    _require_admin(key)
     try:
         conn = sqlite3.connect('karargah.db')
         conn.row_factory = sqlite3.Row
