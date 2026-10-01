@@ -32,6 +32,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 # Yüklenen dosyaları barındıracak klasörü oluştur ve dışa aç
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+def name_key(name: str) -> str:
+    # Türkçe dahil büyük/küçük harf duyarsız karşılaştırma anahtarı: "Akın", "akin", "AKIN" -> "AKIN"
+    return (name or "").strip().upper().replace("İ", "I")
+
 # --- VERİTABANI KURULUMU ---
 def init_db():
     conn = sqlite3.connect("karargah.db")
@@ -47,6 +51,23 @@ def init_db():
     if "auth_id" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN auth_id TEXT")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_auth_id ON users(auth_id)")
+    # Kod adı yazıldığı gibi saklanır (Akın), benzersizlik ise büyük/küçük harften bağımsız anahtarla (AKIN)
+    if "name_key" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN name_key TEXT")
+    for (u,) in c.execute("SELECT username FROM users WHERE name_key IS NULL").fetchall():
+        c.execute("UPDATE users SET name_key = ? WHERE username = ?", (name_key(u), u))
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name_key ON users(name_key)")
+    # Prime süresi: NULL = süresiz (elle verilen eski Prime'lar), dolu = bu tarihe kadar geçerli
+    if "prime_until" not in [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]:
+        c.execute("ALTER TABLE users ADD COLUMN prime_until TEXT")
+    # Mesaj zamanı: arama sonuçlarında tarih göstermek için (eski mesajlarda boş kalır)
+    if "created_at" not in [r[1] for r in c.execute("PRAGMA table_info(messages)").fetchall()]:
+        c.execute("ALTER TABLE messages ADD COLUMN created_at TEXT")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(server_name, channel_name, id)")
+    # Bildirimler: @bahsetme ve arkadaşlık istekleri
+    c.execute('''CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, kind TEXT,
+                 room TEXT, channel TEXT, sender TEXT, text TEXT, created_at TEXT, is_read INTEGER DEFAULT 0)''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(username, id)")
     conn.commit()
     conn.close()
 
@@ -108,17 +129,18 @@ def _resolve_username(auth_id: str, wanted: str) -> str:
         row = db.execute("SELECT username FROM users WHERE auth_id = ?", (auth_id,)).fetchone()
         if row:
             return row["username"]
-        wanted = (wanted or "").strip().upper()
+        wanted = (wanted or "").strip()
         if not USERNAME_RE.match(wanted):
             raise AuthError(400, "Geçersiz kod adı (2-24 karakter; boşluk, _ / ? # % kullanılamaz).")
-        row = db.execute("SELECT auth_id FROM users WHERE username = ?", (wanted,)).fetchone()
+        row = db.execute("SELECT username, auth_id FROM users WHERE name_key = ?", (name_key(wanted),)).fetchone()
         if row and row["auth_id"] and row["auth_id"] != auth_id:
             raise AuthError(409, "Bu kod adı başka bir operatöre ait.")
         if row:
-            db.execute("UPDATE users SET auth_id = ? WHERE username = ?", (auth_id, wanted))
+            db.execute("UPDATE users SET auth_id = ? WHERE username = ?", (auth_id, row["username"]))
+            wanted = row["username"]
         else:
-            db.execute("INSERT INTO users (username, avatar_url, is_prime, friend_code, auth_id) VALUES (?, '', 0, ?, ?)",
-                       (wanted, ''.join(random.choices(string.digits, k=8)), auth_id))
+            db.execute("INSERT INTO users (username, avatar_url, is_prime, friend_code, auth_id, name_key) VALUES (?, '', 0, ?, ?, ?)",
+                       (wanted, ''.join(random.choices(string.digits, k=8)), auth_id, name_key(wanted)))
         db.commit()
         return wanted
     except sqlite3.IntegrityError:
@@ -172,6 +194,19 @@ def base_url_from(headers, scheme: str) -> str:
     proto = headers.get("x-forwarded-proto", scheme)
     host = headers.get("x-forwarded-host") or headers.get("host", "")
     return f"{proto}://{host}"
+
+# --- PRIME KURALLARI (sunucu tarafında zorunlu; sadece arayüzde kısıtlamak yetmez) ---
+FREE_SERVER_LIMIT = 3        # Prime olmayan en fazla 3 karargah kurabilir
+FREE_VOICE_CAPACITY = 4      # Prime olmayan, 4 kişinin olduğu bir ses kanalına 5. olarak giremez
+
+def prime_row_active(row) -> bool:
+    if not row or not row["is_prime"]:
+        return False
+    until = row["prime_until"]
+    return not until or until > datetime.now().isoformat(timespec="seconds")
+
+def user_is_prime(db, username: str) -> bool:
+    return prime_row_active(db.execute("SELECT is_prime, prime_until FROM users WHERE username = ?", (username,)).fetchone())
 
 def is_own_upload(url: str, base: str) -> bool:
     # Avatar/logo/resim linki sadece kendi sunucumuzdaki dosya olabilir
@@ -245,6 +280,37 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# --- BİLDİRİMLER (@bahsetme, arkadaşlık isteği) ---
+MENTION_RE = re.compile(r"(?<!\S)@([^\s@_/?#%\\<>\"',.;:!()\[\]{}]{2,24})")
+
+def add_notification(username: str, kind: str, sender: str, text: str = "", room: str = "", channel: str = "") -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    db = get_db()
+    cur = db.execute("INSERT INTO notifications (username, kind, room, channel, sender, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (username, kind, room, channel, sender, text[:300], now))
+    db.commit()
+    db.close()
+    return {"id": cur.lastrowid, "kind": kind, "room": room, "channel": channel, "sender": sender, "text": text[:300], "created_at": now, "is_read": 0}
+
+async def push_notification(username: str, notif: dict):
+    ws = manager.user_connections.get(username)
+    if ws is not None:
+        await manager.safe_send(ws, json.dumps({"type": "notification", "notification": notif}))
+
+async def notify_mentions(room: str, channel: str, sender: str, text: str):
+    keys = {name_key(m) for m in MENTION_RE.findall(text)}
+    if not keys:
+        return
+    db = get_db()
+    targets = []
+    for k in list(keys)[:10]:  # bir mesajda en fazla 10 kişiye bildirim (spam koruması)
+        row = db.execute("SELECT username FROM users WHERE name_key = ?", (k,)).fetchone()
+        if row and row["username"] != sender and can_access_room(db, room, row["username"]):
+            targets.append(row["username"])
+    db.close()
+    for t in targets:
+        await push_notification(t, add_notification(t, "mention", sender, text, room, channel))
+
 # --- WEBSOCKET UÇ NOKTALARI ---
 async def ws_authenticate(websocket: WebSocket, operator_name: str):
     """Token'ı doğrular; hata olursa bağlantıyı açıklayıcı bir kodla kapatır ve None döner.
@@ -260,6 +326,65 @@ async def ws_authenticate(websocket: WebSocket, operator_name: str):
         await websocket.close(code=4403, reason="Kimlik uyuşmazlığı")
         return None
     return username
+
+# NOT: Bu uç genel /ws/{server_name}/{operator_name} ucundan ÖNCE tanımlanmalı; yoksa
+# /ws/user/X isteği 'user' adlı bir sunucu odası sanılıyordu (çağrı ve arkadaş durumu hiç çalışmıyordu).
+@app.websocket("/ws/user/{operator_name}")
+async def websocket_user_endpoint(websocket: WebSocket, operator_name: str):
+    if await ws_authenticate(websocket, operator_name) is None:
+        return
+    await websocket.accept()
+    old = manager.user_connections.get(operator_name)
+    manager.user_connections[operator_name] = websocket
+    if old is not None and old is not websocket:
+        try: await old.close(code=4000)
+        except Exception: pass
+    
+    # Yeni bağlanan operatörün durumunu bildir
+    my_status = operator_statuses.get(operator_name, "ÇEVRİMİÇİ")
+    for op, conn in list(manager.user_connections.items()):
+        if op != operator_name:
+            try: await conn.send_text(json.dumps({"type": "friend_status", "operator": operator_name, "is_online": my_status != "GİZLİ HAREKAT", "status": my_status}))
+            except: pass
+            
+    try:
+        while True:
+            raw_data = await websocket.receive_text()
+            try:
+                data = json.loads(raw_data)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            msg_type = data.get("type")
+            if msg_type == "ping":
+                await manager.safe_send(websocket, json.dumps({"type": "pong"}))
+            elif msg_type == "call_user":
+                target = data.get("target")
+                if target in manager.user_connections:
+                    await manager.safe_send(manager.user_connections[target], json.dumps({"type": "incoming_call", "caller": operator_name, "dm_room": data.get("dm_room")}))
+                else:
+                    # Aranan çevrimdışı: arayana hemen haber ver (istemci "ulaşılamıyor" gösterir)
+                    await manager.safe_send(websocket, json.dumps({"type": "call_response", "responder": target, "action": "offline"}))
+            elif msg_type == "call_response":
+                target = data.get("target")
+                if target in manager.user_connections:
+                    await manager.safe_send(manager.user_connections[target], json.dumps({"type": "call_response", "responder": operator_name, "action": data.get("action")}))
+            elif msg_type == "status_update":
+                st = data.get("status", "ÇEVRİMİÇİ")
+                operator_statuses[operator_name] = st
+                for op, conn in list(manager.user_connections.items()):
+                    if op != operator_name:
+                        try: await conn.send_text(json.dumps({"type": "friend_status", "operator": operator_name, "is_online": st != "GİZLİ HAREKAT", "status": st}))
+                        except: pass
+    except Exception:
+        pass
+    finally:
+        # Sadece hâlâ kayıtlı socket bizsek sil (yeni sekme eskisinin yerini aldıysa dokunma)
+        if manager.user_connections.get(operator_name) is websocket:
+            del manager.user_connections[operator_name]
+            for op, conn in list(manager.user_connections.items()):
+                await manager.safe_send(conn, json.dumps({"type": "friend_status", "operator": operator_name, "is_online": False, "status": "ÇEVRİMDIŞI"}))
 
 @app.websocket("/ws/{server_name}/{operator_name}")
 async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_name: str):
@@ -278,7 +403,7 @@ async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_na
         operator_statuses[operator_name] = "ÇEVRİMİÇİ"
     
     time_now = datetime.now().strftime("%H:%M")
-    await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name.upper()} AĞA BAĞLANDI.", "time": time_now}), server_name)
+    await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name} ağa bağlandı.", "time": time_now}), server_name)
     await manager.broadcast_online_users(server_name)
     # Yeni gelen, odada kimin hangi ses kanalında olduğunu hemen görsün
     for op, ch in list(manager.voice_members.get(server_name, {}).items()):
@@ -300,11 +425,31 @@ async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_na
                 await manager.safe_send(websocket, json.dumps({"type": "pong"}))
                 continue
 
+            if msg_type == "sync":
+                # İstemci arka plandaki soketi tekrar öne aldığında güncel durumu ister
+                room = manager.active_connections.get(server_name, {})
+                visible = [op for op in room if op == operator_name or operator_statuses.get(op, "ÇEVRİMİÇİ") != "GİZLİ HAREKAT"]
+                await manager.safe_send(websocket, json.dumps({"type": "online_users", "users": visible}))
+                for op, ch in list(manager.voice_members.get(server_name, {}).items()):
+                    if op != operator_name:
+                        await manager.safe_send(websocket, json.dumps({"type": "voice_join", "sender": op, "voice_channel": ch, "announce": True}))
+                continue
+
             if msg_type in RELAY_TYPES:
                 # Kimlik sahteciliğini engelle: gönderen her zaman bu socket'in sahibi
                 data["sender"] = operator_name
                 if msg_type == "voice_join":
-                    manager.voice_members.setdefault(server_name, {})[operator_name] = data.get("voice_channel", "")
+                    ch = data.get("voice_channel", "")
+                    others = [op for op, c in manager.voice_members.get(server_name, {}).items() if c == ch and op != operator_name]
+                    if len(others) >= FREE_VOICE_CAPACITY:
+                        _db = get_db()
+                        allowed = user_is_prime(_db, operator_name)
+                        _db.close()
+                        if not allowed:
+                            await manager.safe_send(websocket, json.dumps({"type": "voice_denied", "voice_channel": ch,
+                                "reason": f"Kanal dolu ({FREE_VOICE_CAPACITY}/{FREE_VOICE_CAPACITY}). Kalabalık kanallara katılmak Prime'a özeldir."}))
+                            continue
+                    manager.voice_members.setdefault(server_name, {})[operator_name] = ch
                 elif msg_type == "voice_leave":
                     manager.voice_members.get(server_name, {}).pop(operator_name, None)
                 out = json.dumps(data)
@@ -328,10 +473,12 @@ async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_na
                 time_now = datetime.now().strftime("%H:%M")
                 
                 conn = sqlite3.connect("karargah.db")
-                conn.execute("INSERT INTO messages (server_name, channel_name, sender, text, time_str, msg_type) VALUES (?, ?, ?, ?, ?, ?)", (server_name, channel_name, sender, text, time_now, msg_type))
+                conn.execute("INSERT INTO messages (server_name, channel_name, sender, text, time_str, msg_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (server_name, channel_name, sender, text, time_now, msg_type, datetime.now().isoformat(timespec="seconds")))
                 conn.commit()
                 conn.close()
                 await manager.broadcast(json.dumps({"type": msg_type, "name": sender, "text": text, "time": time_now, "channel_name": channel_name}), server_name)
+                if msg_type == "chat" and "@" in text:
+                    await notify_mentions(server_name, channel_name, sender, text)
                 
     except WebSocketDisconnect:
         pass
@@ -350,7 +497,7 @@ async def websocket_endpoint(websocket: WebSocket, server_name: str, operator_na
             if not still_here and operator_name not in manager.user_connections:
                 operator_statuses.pop(operator_name, None)
             time_now = datetime.now().strftime("%H:%M")
-            await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name.upper()} BAĞLANTIYI KESTİ.", "time": time_now}), server_name)
+            await manager.broadcast(json.dumps({"type": "system", "text": f"{operator_name} bağlantıyı kesti.", "time": time_now}), server_name)
             await manager.broadcast_online_users(server_name)
 
 # --- TURN SUNUCUSU (NAT/CGNAT arkasındaki kullanıcılar için ses rölesi) ---
@@ -388,61 +535,6 @@ async def ice_servers(me: str = Depends(current_user)):
         print("TURN kimlik bilgisi alınamadı:", e)
     return {"iceServers": DEFAULT_ICE}
 
-@app.websocket("/ws/user/{operator_name}")
-async def websocket_user_endpoint(websocket: WebSocket, operator_name: str):
-    if await ws_authenticate(websocket, operator_name) is None:
-        return
-    await websocket.accept()
-    old = manager.user_connections.get(operator_name)
-    manager.user_connections[operator_name] = websocket
-    if old is not None and old is not websocket:
-        try: await old.close(code=4000)
-        except Exception: pass
-    
-    # Yeni bağlanan operatörün durumunu bildir
-    my_status = operator_statuses.get(operator_name, "ÇEVRİMİÇİ")
-    for op, conn in list(manager.user_connections.items()):
-        if op != operator_name:
-            try: await conn.send_text(json.dumps({"type": "friend_status", "operator": operator_name, "is_online": my_status != "GİZLİ HAREKAT", "status": my_status}))
-            except: pass
-            
-    try:
-        while True:
-            raw_data = await websocket.receive_text()
-            try:
-                data = json.loads(raw_data)
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            msg_type = data.get("type")
-            if msg_type == "ping":
-                await manager.safe_send(websocket, json.dumps({"type": "pong"}))
-            elif msg_type == "call_user":
-                target = data.get("target")
-                if target in manager.user_connections:
-                    await manager.user_connections[target].send_text(json.dumps({"type": "incoming_call", "caller": operator_name, "dm_room": data.get("dm_room")}))
-            elif msg_type == "call_response":
-                target = data.get("target")
-                if target in manager.user_connections:
-                    await manager.user_connections[target].send_text(json.dumps({"type": "call_response", "responder": operator_name, "action": data.get("action")}))
-            elif msg_type == "status_update":
-                st = data.get("status", "ÇEVRİMİÇİ")
-                operator_statuses[operator_name] = st
-                for op, conn in list(manager.user_connections.items()):
-                    if op != operator_name:
-                        try: await conn.send_text(json.dumps({"type": "friend_status", "operator": operator_name, "is_online": st != "GİZLİ HAREKAT", "status": st}))
-                        except: pass
-    except Exception:
-        pass
-    finally:
-        # Sadece hâlâ kayıtlı socket bizsek sil (yeni sekme eskisinin yerini aldıysa dokunma)
-        if manager.user_connections.get(operator_name) is websocket:
-            del manager.user_connections[operator_name]
-            for op, conn in list(manager.user_connections.items()):
-                await manager.safe_send(conn, json.dumps({"type": "friend_status", "operator": operator_name, "is_online": False, "status": "ÇEVRİMDIŞI"}))
-
-
 # --- REST API UÇ NOKTALARI ---
 def get_db():
     conn = sqlite3.connect("karargah.db")
@@ -452,11 +544,11 @@ def get_db():
 @app.get("/api/username-available/{username}")
 async def username_available(username: str):
     # Kayıt ekranı, Supabase hesabı açmadan önce kod adının boş olup olmadığını sorar
-    name = username.strip().upper()
+    name = username.strip()
     if not USERNAME_RE.match(name):
         return {"available": False, "reason": "Geçersiz kod adı (2-24 karakter; boşluk, _ / ? # % kullanılamaz)."}
     db = get_db()
-    row = db.execute("SELECT auth_id FROM users WHERE username = ?", (name,)).fetchone()
+    row = db.execute("SELECT auth_id FROM users WHERE name_key = ?", (name_key(name),)).fetchone()
     db.close()
     taken = bool(row and row["auth_id"])
     return {"available": not taken, "reason": "Bu kod adı alınmış." if taken else ""}
@@ -475,9 +567,9 @@ async def register(request: Request, data: dict = None):
 @app.get("/api/get-profile/{username}")
 async def get_profile(username: str, me: str = Depends(current_user)):
     db = get_db()
-    user = db.execute("SELECT avatar_url FROM users WHERE username = ?", (username,)).fetchone()
+    user = db.execute("SELECT avatar_url, is_prime, prime_until FROM users WHERE username = ?", (username,)).fetchone()
     db.close()
-    return {"status": "success", "avatar_url": (user["avatar_url"] or "") if user else ""}
+    return {"status": "success", "avatar_url": (user["avatar_url"] or "") if user else "", "is_prime": 1 if prime_row_active(user) else 0}
 
 @app.post("/api/update-profile")
 async def update_profile(request: Request, data: dict, me: str = Depends(current_user)):
@@ -485,6 +577,9 @@ async def update_profile(request: Request, data: dict, me: str = Depends(current
     if not is_own_upload(avatar, public_base_url(request)):
         raise HTTPException(400, "Geçersiz görsel adresi.")
     db = get_db()
+    if avatar.lower().endswith(".gif") and not user_is_prime(db, me):
+        db.close()
+        raise HTTPException(403, "Hareketli (GIF) avatar Prime'a özeldir.")
     db.execute("UPDATE users SET avatar_url = ? WHERE username = ?", (avatar, me))
     db.commit()
     db.close()
@@ -494,9 +589,10 @@ async def update_profile(request: Request, data: dict, me: str = Depends(current
 async def check_prime(username: str, me: str = Depends(current_user)):
     # Yol parametresi geriye uyumluluk için duruyor; her zaman oturum sahibinin durumu döner
     db = get_db()
-    user = db.execute("SELECT is_prime FROM users WHERE username = ?", (me,)).fetchone()
+    row = db.execute("SELECT is_prime, prime_until FROM users WHERE username = ?", (me,)).fetchone()
     db.close()
-    return {"is_prime": user["is_prime"] if user else 0}
+    active = prime_row_active(row)
+    return {"is_prime": 1 if active else 0, "prime_until": row["prime_until"] if active and row else None}
 
 @app.get("/api/servers/{username}")
 async def get_servers(username: str, me: str = Depends(current_user)):
@@ -511,6 +607,10 @@ async def create_server(data: dict, me: str = Depends(current_user)):
     if not (2 <= len(name) <= 40) or name.startswith("DM_") or name == "@HOME" or "/" in name:
         raise HTTPException(400, "Geçersiz karargah adı.")
     db = get_db()
+    owned = db.execute("SELECT COUNT(*) FROM servers WHERE owner = ?", (me,)).fetchone()[0]
+    if owned >= FREE_SERVER_LIMIT and not user_is_prime(db, me):
+        db.close()
+        raise HTTPException(403, f"Ücretsiz hesaplar en fazla {FREE_SERVER_LIMIT} karargah kurabilir. Sınırsız karargah için Prime'a geçin.")
     try:
         db.execute("INSERT INTO servers (name, owner, icon_url, invite_code) VALUES (?, ?, '', ?)", (name, me, ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))))
         db.execute("INSERT INTO server_members (server_name, username, role) VALUES (?, ?, 'KURUCU')", (name, me))
@@ -571,9 +671,9 @@ async def get_messages(server_name: str, channel_name: str, me: str = Depends(cu
 async def get_roles(server_name: str, me: str = Depends(current_user)):
     db = get_db()
     require_room_access(db, server_name, me)
-    roles = db.execute("SELECT username, role FROM server_members WHERE server_name = ?", (server_name,)).fetchall()
+    roles = db.execute("SELECT sm.username, sm.role, u.is_prime, u.prime_until FROM server_members sm LEFT JOIN users u ON u.username = sm.username WHERE sm.server_name = ?", (server_name,)).fetchall()
     db.close()
-    return {"roles": {r["username"]: r["role"] for r in roles}}
+    return {"roles": {r["username"]: r["role"] for r in roles}, "prime": [r["username"] for r in roles if prime_row_active(r)]}
 
 @app.post("/api/server/role")
 async def assign_role(data: dict, me: str = Depends(current_user)):
@@ -693,7 +793,7 @@ async def get_friends(username: str, me: str = Depends(current_user)):
 async def add_friend(data: dict, me: str = Depends(current_user)):
     db = get_db()
     q = str(data.get("target", "")).strip()
-    target = db.execute("SELECT username FROM users WHERE username = ? OR friend_code = ?", (q.upper(), q)).fetchone()
+    target = db.execute("SELECT username FROM users WHERE name_key = ? OR friend_code = ?", (name_key(q), q)).fetchone()
     if not target:
         db.close()
         raise HTTPException(400, "Operatör bulunamadı!")
@@ -707,7 +807,43 @@ async def add_friend(data: dict, me: str = Depends(current_user)):
     db.execute("INSERT INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", (me, t))
     db.commit()
     db.close()
+    await push_notification(t, add_notification(t, "friend_request", me, f"{me} sana arkadaşlık isteği gönderdi."))
     return {"message": "İstek gönderildi."}
+
+@app.get("/api/notifications")
+async def get_notifications(me: str = Depends(current_user)):
+    db = get_db()
+    rows = db.execute("SELECT id, kind, room, channel, sender, text, created_at, is_read FROM notifications WHERE username = ? ORDER BY id DESC LIMIT 50", (me,)).fetchall()
+    unread = db.execute("SELECT COUNT(*) FROM notifications WHERE username = ? AND is_read = 0", (me,)).fetchone()[0]
+    db.close()
+    return {"notifications": [dict(r) for r in rows], "unread": unread}
+
+@app.post("/api/notifications/read")
+async def read_notifications(me: str = Depends(current_user)):
+    db = get_db()
+    db.execute("UPDATE notifications SET is_read = 1 WHERE username = ? AND is_read = 0", (me,))
+    # Eski bildirimleri temizle: kişi başı son 200 kalsın
+    db.execute("DELETE FROM notifications WHERE username = ? AND id NOT IN (SELECT id FROM notifications WHERE username = ? ORDER BY id DESC LIMIT 200)", (me, me))
+    db.commit()
+    db.close()
+    return {"status": "success"}
+
+@app.get("/api/search/{server_name}")
+async def search_messages(server_name: str, q: str = "", channel: str = "", me: str = Depends(current_user)):
+    q = q.strip()
+    if len(q) < 2:
+        return {"results": []}
+    db = get_db()
+    require_room_access(db, server_name, me)
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    sql = "SELECT id, channel_name, sender AS name, text, time_str AS time, created_at, msg_type AS type FROM messages WHERE server_name = ? AND msg_type = 'chat' AND text LIKE ? ESCAPE '\\'"
+    args = [server_name, like]
+    if channel:
+        sql += " AND channel_name = ?"
+        args.append(channel)
+    rows = db.execute(sql + " ORDER BY id DESC LIMIT 50", args).fetchall()
+    db.close()
+    return {"results": [dict(r) for r in rows]}
 
 @app.post("/api/friends/respond")
 async def res_friend(data: dict, me: str = Depends(current_user)):
@@ -739,26 +875,70 @@ def _require_admin(key: str):
         raise HTTPException(404, "Not Found")
 
 @app.get("/api/secret-prime/{username}")
-async def secret_give_prime(username: str, key: str = ""):
+async def secret_give_prime(username: str, key: str = "", days: int = 30):
     _require_admin(key)
+    # days=30 (varsayılan): 30 gün ekler; zaten Prime ise kalan sürenin ÜSTÜNE ekler. days=0: süresiz Prime.
+    db = get_db()
+    row = db.execute("SELECT username, is_prime, prime_until FROM users WHERE name_key = ?", (name_key(username),)).fetchone()
+    if not row:
+        db.close()
+        return {"error": f"{username} adında bir operatör bulunamadı."}
+    if days <= 0:
+        until = None
+    else:
+        from datetime import timedelta
+        base = datetime.now()
+        if prime_row_active(row) and row["prime_until"]:
+            base = max(base, datetime.fromisoformat(row["prime_until"]))
+        until = (base + timedelta(days=days)).isoformat(timespec="seconds")
+    db.execute("UPDATE users SET is_prime = 1, prime_until = ? WHERE username = ?", (until, row["username"]))
+    db.commit()
+    db.close()
+    return {"status": "success", "message": f"Tebrikler! {row['username']} artık PRIME statüsünde.",
+            "prime_until": until or "süresiz"}
+
+@app.get("/api/secret-unprime/{username}")
+async def secret_remove_prime(username: str, key: str = ""):
+    _require_admin(key)
+    db = get_db()
+    cur = db.execute("UPDATE users SET is_prime = 0, prime_until = NULL WHERE name_key = ?", (name_key(username),))
+    db.commit()
+    db.close()
+    return {"status": "success" if cur.rowcount else "error", "message": f"{username} Prime'dan çıkarıldı." if cur.rowcount else "Bulunamadı."}
+
+# --- YÖNETİCİ: KOD ADI DEĞİŞTİRME (örn. AKIN -> Akın) ---
+@app.get("/api/secret-rename/{old}/{new}")
+async def secret_rename(old: str, new: str, key: str = ""):
+    _require_admin(key)
+    new = new.strip()
+    if not USERNAME_RE.match(new):
+        return {"error": "Geçersiz yeni kod adı (2-24 karakter; boşluk, _ / ? # % kullanılamaz)."}
+    db = get_db()
     try:
-        conn = sqlite3.connect('karargah.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [t[0] for t in cursor.fetchall()]
-        table_name = next((t for t in ['users', 'user', 'operators'] if t in tables), None)
-        if not table_name: return {"error": f"Tablo bulunamadı! Tablolar: {tables}"}
-        
-        cursor.execute(f"PRAGMA table_info({table_name})")
-        columns = [c[1] for c in cursor.fetchall()]
-        if "is_prime" not in columns: cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN is_prime INTEGER DEFAULT 0")
-        
-        cursor.execute(f"UPDATE {table_name} SET is_prime = 1 WHERE username = ?", (username,))
-        conn.commit()
-        conn.close()
-        return {"status": "success", "message": f"Tebrikler! {username} artık PRIME statüsünde."}
-    except Exception as e:
-        return {"error": str(e)}
+        row = db.execute("SELECT username FROM users WHERE name_key = ?", (name_key(old),)).fetchone()
+        if not row:
+            return {"error": f"{old} bulunamadı."}
+        old = row["username"]
+        clash = db.execute("SELECT username FROM users WHERE name_key = ? AND username != ?", (name_key(new), old)).fetchone()
+        if clash:
+            return {"error": f"{new} adı zaten {clash['username']} tarafından kullanılıyor."}
+        db.execute("UPDATE users SET username = ?, name_key = ? WHERE username = ?", (new, name_key(new), old))
+        db.execute("UPDATE servers SET owner = ? WHERE owner = ?", (new, old))
+        db.execute("UPDATE server_members SET username = ? WHERE username = ?", (new, old))
+        db.execute("UPDATE messages SET sender = ? WHERE sender = ?", (new, old))
+        db.execute("UPDATE friends SET user1 = ? WHERE user1 = ?", (new, old))
+        db.execute("UPDATE friends SET user2 = ? WHERE user2 = ?", (new, old))
+        # DM oda adları kod adlarını içerir (DM_<a>_<b>, alfabetik): mesajları yeni oda adına taşı
+        for (room,) in db.execute("SELECT DISTINCT server_name FROM messages WHERE server_name LIKE 'DM\\_%' ESCAPE '\\'").fetchall():
+            parts = dm_participants(room)
+            if parts and old in parts:
+                parts = sorted(new if p == old else p for p in parts)
+                db.execute("UPDATE messages SET server_name = ? WHERE server_name = ?", (f"DM_{parts[0]}_{parts[1]}", room))
+        db.commit()
+    finally:
+        db.close()
+    _token_cache.clear()
+    return {"status": "success", "message": f"{old} artık {new}. Kullanıcı çıkış yapıp tekrar girmeli."}
 
 # --- İSTİHBARAT PANELİ (KULLANICI VE LOG İZLEME) ---
 @app.get("/api/radar/istihbarat")
